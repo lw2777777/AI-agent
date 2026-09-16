@@ -1,0 +1,43 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── 虚拟环境 ──
+venv/
+.venv/
+env/
+ENV/
+
+# ── 密钥 / 配置（★ 最重要）──
+.env
+.env.*
+*.key
+*secret*
+config.local.*
+api_keys.json
+
+# ── 日志 / 数据 ──
+*.log
+logs/
+traces/
+*.db
+*.sqlite
+
+# ── IDE ──
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ── 测试 / 缓存 ──
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/ 

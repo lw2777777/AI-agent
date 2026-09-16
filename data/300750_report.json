@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-09-10T19:09:48.762589",
+  "analysis": {
+    "symbol": "300750",
+    "current_price": 338.06,
+    "trend": "bearish",
+    "rsi": 11.07200469277015,
+    "macd": {
+      "macd": -13.020090840083526,
+      "signal": -9.293785710502847
+    },
+    "ma5": 341.918,
+    "ma20": 368.47349999999994,
+    "signals": [
+      "oversold",
+      "macd_bearish"
+    ],
+    "recommendation": "hold",
+    "confidence": 0.5
+  },
+  "llm_analysis": null
+}

@@ -1,0 +1,168 @@
+{
+  "agent_info": {
+    "name": "TradingAgent",
+    "version": "1.0.0",
+    "description": "智能交易决策Agent，负责生成买卖信号和执行交易",
+    "type": "trading",
+    "enabled": true
+  },
+  "model_config": {
+    "provider": "openai",
+    "model_name": "gpt-4",
+    "temperature": 0.3,
+    "max_tokens": 2000,
+    "top_p": 0.9,
+    "frequency_penalty": 0.1,
+    "presence_penalty": 0.1,
+    "fallback_model": "gpt-3.5-turbo"
+  },
+  "trading_config": {
+    "symbols": ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META"],
+    "primary_exchange": "NASDAQ",
+    "trading_hours": {
+      "start": "09:30",
+      "end": "16:00",
+      "timezone": "America/New_York"
+    },
+    "position_sizing": {
+      "method": "risk_parity",
+      "max_position_size": 0.20,
+      "min_position_size": 0.01,
+      "max_leverage": 1.0
+    },
+    "risk_management": {
+      "max_drawdown": 0.15,
+      "stop_loss": 0.05,
+      "take_profit": 0.10,
+      "risk_per_trade": 0.02,
+      "max_daily_loss": 0.03,
+      "max_trades_per_day": 10
+    },
+    "order_types": ["market", "limit", "stop_loss", "take_profit"],
+    "execution": {
+      "slippage_model": "fixed",
+      "slippage_bps": 5,
+      "commission_model": "per_share",
+      "commission_rate": 0.005,
+      "min_commission": 1.0
+    }
+  },
+  "strategy_config": {
+    "primary_strategy": "momentum_breakout",
+    "secondary_strategy": "mean_reversion",
+    "signal_fusion": {
+      "method": "weighted_vote",
+      "weights": {
+        "momentum": 0.5,
+        "mean_reversion": 0.3,
+        "sentiment": 0.2
+      },
+      "min_confidence": 0.6
+    },
+    "indicators": {
+      "trend": ["SMA_20", "SMA_50", "SMA_200", "EMA_12", "EMA_26"],
+      "momentum": ["RSI_14", "MACD", "Stochastic"],
+      "volatility": ["BB_20", "ATR_14"],
+      "volume": ["Volume_SMA_20", "OBV"],
+      "custom": ["VWAP", "MFI_14"]
+    },
+    "timeframes": {
+      "primary": "1d",
+      "secondary": "1h",
+      "tertiary": "15m"
+    },
+    "holding_period": {
+      "min": 1,
+      "max": 30,
+      "unit": "days"
+    }
+  },
+  "data_config": {
+    "sources": {
+      "primary": "yfinance",
+      "secondary": "polygon",
+      "fundamental": "fred"
+    },
+    "cache": {
+      "enabled": true,
+      "ttl": 300,
+      "max_size": 1000
+    },
+    "update_frequency": {
+      "live": "1s",
+      "historical": "1d"
+    },
+    "data_quality": {
+      "min_data_points": 252,
+      "max_gap_days": 5,
+      "remove_outliers": true
+    }
+  },
+  "learning_config": {
+    "online_learning": {
+      "enabled": true,
+      "batch_size": 100,
+      "update_frequency": "daily"
+    },
+    "reinforcement_learning": {
+      "enabled": false,
+      "algorithm": "PPO",
+      "reward_function": "sharpe_ratio"
+    },
+    "feedback_loop": {
+      "enabled": true,
+      "feedback_types": ["trade_result", "market_condition"],
+      "weight_decay": 0.95
+    }
+  },
+  "performance_metrics": {
+    "tracked_metrics": [
+      "sharpe_ratio",
+      "max_drawdown",
+      "win_rate",
+      "profit_factor",
+      "average_return",
+      "volatility",
+      "calmar_ratio",
+      "sortino_ratio"
+    ],
+    "benchmark": "SPY",
+    "evaluation_frequency": "daily"
+  },
+  "guardrails": {
+    "enabled": true,
+    "circuit_breakers": {
+      "daily_loss_limit": 0.05,
+      "consecutive_losses": 3,
+      "volatility_spike": 0.10
+    },
+    "validation": {
+      "symbol_whitelist": true,
+      "price_check": true,
+      "volume_check": true
+    }
+  },
+  "integration": {
+    "portfolio_agent": {
+      "enabled": true,
+      "communication_channel": "mqtt",
+      "update_interval": 60
+    },
+    "risk_management": {
+      "enabled": true,
+      "priority": "high"
+    },
+    "backtest_engine": {
+      "enabled": true,
+      "auto_validate": true
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "json",
+    "outputs": ["console", "file"],
+    "file_path": "/Users/a3/Desktop/AI agent/logs/trading_agent.log",
+    "rotation": "1d",
+    "retention": "30d"
+  }
+}

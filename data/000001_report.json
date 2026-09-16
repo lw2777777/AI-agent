@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-09-10T19:09:40.809927",
+  "analysis": {
+    "symbol": "000001",
+    "current_price": 11.85,
+    "trend": "bullish",
+    "rsi": 66.41791044776116,
+    "macd": {
+      "macd": 0.17020411827038018,
+      "signal": 0.17817507039341943
+    },
+    "ma5": 11.783999999999999,
+    "ma20": 11.5905,
+    "signals": [
+      "macd_bearish"
+    ],
+    "recommendation": "hold",
+    "confidence": 0.5
+  },
+  "llm_analysis": null
+}

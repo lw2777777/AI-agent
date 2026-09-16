@@ -1,0 +1,190 @@
+{
+  "agent_info": {
+    "name": "PortfolioAgent",
+    "version": "1.0.0",
+    "description": "投资组合管理Agent,负责资产配置、风险评估和组合优化",
+    "type": "portfolio_management",
+    "enabled": true
+  },
+  "model_config": {
+    "provider": "openai",
+    "model_name": "gpt-4",
+    "temperature": 0.2,
+    "max_tokens": 3000,
+    "top_p": 0.85
+  },
+  "portfolio_config": {
+    "initial_capital": 1000000,
+    "base_currency": "USD",
+    "max_positions": 20,
+    "min_position_value": 1000,
+    "rebalancing_frequency": "monthly",
+    "rebalancing_threshold": 0.05,
+    "allowed_asset_classes": ["equity", "etf", "option"],
+    "restricted_symbols": ["GME", "AMC", "BBBY"],
+    "sector_limits": {
+      "technology": 0.30,
+      "finance": 0.20,
+      "healthcare": 0.15,
+      "consumer": 0.15,
+      "energy": 0.10,
+      "real_estate": 0.10
+    }
+  },
+  "asset_allocation": {
+    "strategies": {
+      "default": "modern_portfolio_theory",
+      "alternatives": ["risk_parity", "black_litterman", "factor_investing"]
+    },
+    "risk_parity": {
+      "risk_budget": {
+        "equity": 0.35,
+        "bonds": 0.25,
+        "commodities": 0.20,
+        "real_estate": 0.20
+      },
+      "volatility_target": 0.12,
+      "max_leverage": 1.2
+    },
+    "factor_exposure": {
+      "value": 0.25,
+      "growth": 0.25,
+      "momentum": 0.20,
+      "quality": 0.15,
+      "volatility": 0.15
+    },
+    "dynamic_allocation": {
+      "enabled": true,
+      "market_regime_detection": true,
+      "regime_weights": {
+        "bull": {"equity": 0.70, "bonds": 0.20, "cash": 0.10},
+        "bear": {"equity": 0.30, "bonds": 0.50, "cash": 0.20},
+        "sideways": {"equity": 0.50, "bonds": 0.30, "cash": 0.20},
+        "volatile": {"equity": 0.40, "bonds": 0.40, "cash": 0.20}
+      }
+    }
+  },
+  "risk_management": {
+    "var_config": {
+      "method": "historical",
+      "confidence_level": 0.95,
+      "lookback_days": 252
+    },
+    "cvar_config": {
+      "confidence_level": 0.95,
+      "lookback_days": 252
+    },
+    "drawdown_limits": {
+      "portfolio_max": 0.20,
+      "individual_position": 0.30
+    },
+    "correlation_limits": {
+      "max_correlation": 0.85,
+      "min_correlation": -0.30
+    },
+    "concentration_limits": {
+      "max_single_position": 0.10,
+      "max_sector_exposure": 0.30,
+      "max_industry_exposure": 0.20
+    },
+    "stress_testing": {
+      "scenarios": ["2008_crisis", "2020_covid", "2022_bear_market"],
+      "shock_sizes": {
+        "market": -0.25,
+        "sector": -0.15,
+        "single_stock": -0.30
+      }
+    }
+  },
+  "optimization": {
+    "objective": "maximize_sharpe_ratio",
+    "constraints": {
+      "budget": 1.0,
+      "long_only": true,
+      "max_weight": 0.10,
+      "min_weight": 0.01
+    },
+    "method": "mean_variance",
+    "risk_free_rate": 0.04,
+    "optimization_frequency": "weekly",
+    "lookback_period": 60,
+    "covariance_method": "ledoit_wolf"
+  },
+  "performance_benchmarks": {
+    "primary": "S&P500",
+    "secondary": "NASDAQ-100",
+    "custom_benchmarks": ["60/40_portfolio", "risk_parity_benchmark"]
+  },
+  "rebalancing": {
+    "trigger_types": ["time_based", "threshold_based", "signal_based"],
+    "time_based": {
+      "frequency": "monthly",
+      "day_of_month": 1
+    },
+    "threshold_based": {
+      "drift_threshold": 0.05,
+      "check_frequency": "daily"
+    },
+    "tax_efficient": true,
+    "transaction_cost_model": {
+      "bid_ask_spread": 0.001,
+      "market_impact": 0.0005,
+      "commission": 0.001
+    }
+  },
+  "reporting": {
+    "generate_reports": true,
+    "report_frequency": "monthly",
+    "report_types": ["performance", "risk", "attribution", "holdings"],
+    "include_charts": true,
+    "email_reports": false,
+    "email_recipients": [],
+    "report_format": "pdf"
+  },
+  "integration": {
+    "trading_agents": {
+      "enabled": true,
+      "agent_ids": ["trading_agent_1", "trading_agent_2"],
+      "order_aggregation": "weighted_average"
+    },
+    "risk_management_agent": {
+      "enabled": true,
+      "monitoring_interval": 300
+    },
+    "data_sources": {
+      "market_data": "polygon",
+      "fundamental_data": "fred",
+      "alternative_data": "none"
+    }
+  },
+  "compliance": {
+    "regulatory": {
+      "pattern_day_trader": false,
+      "position_limits": true,
+      "reporting_requirements": true
+    },
+    "internal_policies": {
+      "pre_trade_checks": true,
+      "post_trade_validation": true,
+      "audit_trail": true
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "json",
+    "outputs": ["console", "file", "database"],
+    "file_path": "/Users/a3/Desktop/AI agent/logs/portfolio_agent.log",
+    "database": {
+      "type": "sqlite",
+      "path": "/Users/a3/Desktop/AI agent/data/portfolio.db"
+    },
+    "rotation": "1d",
+    "retention": "90d"
+  },
+  "backup": {
+    "enabled": true,
+    "frequency": "daily",
+    "retention": 30,
+    "storage_path": "/Users/a3/Desktop/AI agent/backups/"
+  }
+}
