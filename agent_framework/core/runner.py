@@ -247,6 +247,7 @@ class AgenticRunner:
     def _create_agent(self, config: Dict[str, Any],tracer: Optional[Tracer] = None):
         """创建Agent"""
         from .core_agent import CoreAgent
+        from .retry import RetryPolicy
         from ..tools.tools_registry import ToolsRegistry
 
         # 获取工具
@@ -268,6 +269,13 @@ class AgenticRunner:
             from .archival_memory import ArchivalMemoryStore
             memory_store = ArchivalMemoryStore(self.db_path)
 
+         # ★ 重试策略
+        retry_cfg = config.get('retry', {})
+        retry_policy = RetryPolicy(
+             max_attempts=retry_cfg.get('max_attempts', 3),
+             base_delay=retry_cfg.get('base_delay', 1.0),
+             max_delay=retry_cfg.get('max_delay', 10.0),
+         )
 
         # 创建Agent
         return CoreAgent(
@@ -276,10 +284,13 @@ class AgenticRunner:
             tools=tools,
             memory_store=memory_store,
             max_iterations=config.get('max_iterations', 10),
+            retry_policy=retry_policy,          # ← 按 core-agent 实际名字
+            circuit_threshold=5,
             enable_reflection=config.get('enable_reflection', True),
             verbose=config.get('verbose', True),
             tracer=tracer or Tracer(),
-        )
+            session_id=config.get("session_id")
+         )
 
     def _create_llm(self, model_config: Dict[str, Any]):
        from .llm_adapter import LLMAdapter

@@ -21,6 +21,9 @@ from .archival_memory import ArchivalMemoryStore
 from .reflector import Reflector, ReflectionResult
 from .trace import Tracer
 import time
+from .context_manager import ContextManager
+from .retry import RetryPolicy, retry_call
+from .circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +78,14 @@ class CoreAgent:
 
     def __init__(
         self,
+        llm_retry_policy: Optional[RetryPolicy] = None,
+        circuit_threshold: int = 5,
+    # ★ 新增：上下文压缩
+        context_max_tokens: int = 8000,
+        context_keep_recent: int = 4,
+        enable_context_compression: bool = True,
+        # ★ 新增：错误恢复
+        retry_policy: Optional[RetryPolicy] = None,
         name: str = "CoreAgent",
         llm: Optional[Any] = None,
         tools: Optional[List[Any]] = None,
@@ -111,6 +122,18 @@ class CoreAgent:
         self._reflector: Optional[Reflector] = None
         self.tracer = tracer or Tracer()
 
+        self.enable_context_compression = enable_context_compression
+        self._context_manager = ContextManager(
+            max_tokens=context_max_tokens,
+            keep_recent=context_keep_recent,
+            llm=self._make_summary_llm(llm),  # ★ 带重试的包装
+        )
+    # 压缩统计
+        self._compression_stats = {
+           "total_compressions": 0,
+           "total_tokens_saved": 0,
+        }
+
         # 反思相关开关
         self.high_risk_tools = kwargs.get(
             "high_risk_tools",
@@ -120,6 +143,37 @@ class CoreAgent:
 
         # 系统提示词
         self.system_prompt = self._build_system_prompt()
+
+
+    def _make_summary_llm(self, llm):
+        """
+      包装 LLM,让摘要调用也走重试策略。
+      如果 llm 是 None,返回 None（ContextManager 会 fallback）。
+       """
+        if llm is None:
+            return None
+
+        class _SummaryLLM:
+            def __init__(self, inner, agent):
+               self._inner = inner
+               self._agent = agent
+            def chat(self, messages, tools=None, tool_choice=None, **kwargs):
+            # 摘要不传 tools
+                def _do():
+                    return self._inner.chat(
+                        messages=messages,
+                        tools=None,
+                        tool_choice=None,
+                    )
+                try:
+                    return retry_call(_do, self._agent.llm_retry_policy)
+                except Exception:
+                    logger.exception("summary LLM failed after retries")
+                # 抛出去让 ContextManager 走 fallback
+                    raise
+
+        return _SummaryLLM(llm, self)
+
 
     # ─────────────────────────────────────────────
     # 工具索引 / 提示词
@@ -226,6 +280,23 @@ class CoreAgent:
 
         return "\n".join(lines)
 
+
+    def _call_llm_with_retry(self, messages, tool_schemas):
+        """Layer 1: LLM 调用带重试"""
+        def _do_call():
+            return self.llm.chat(
+                messages=messages,
+                tools=tool_schemas if tool_schemas else None,
+                tool_choice="auto" if tool_schemas else None,
+            )
+
+        def _on_retry(attempt, exc, delay):
+            logger.warning(
+                "LLM call retry %d after %s, waiting %.1fs",
+                attempt + 1, type(exc).__name__, delay,
+            ) #装饰包装模式 代码逻辑分离 不改原代码、动态增强功能、高度复用、灵活组合、易于维护      横切关注点分离
+
+        return retry_call(_do_call, self.llm_retry_policy, on_retry=_on_retry)
     # ─────────────────────────────────────────────
     # 工具执行
     # ─────────────────────────────────────────────
@@ -321,6 +392,41 @@ class CoreAgent:
                         logger.info(f"🔄 Iteration {i+1}/{self.max_iterations}")
                     self.state = AgentState.THINKING
 
+                    # ══════════════════════════════════════════════
+                    # ★ 上下文压缩
+                    # ══════════════════════════════════════════════
+                    if self.enable_context_compression:
+                        try:
+                            comp = self._context_manager.compress(
+                                messages, task=query,
+                            )
+                            if comp.compressed:
+                                messages = comp.messages
+                                self._compression_stats["total_compressions"] += 1
+                                saved = comp.original_tokens - comp.final_tokens
+                                self._compression_stats["total_tokens_saved"] += saved
+
+                                logger.info(
+                                    "🗜️ context compressed: %d→%d tokens "
+                                    "(saved %d, dropped %d msgs, truncated %d tools)",
+                                    comp.original_tokens, comp.final_tokens,
+                                    saved, comp.dropped_messages,
+                                    comp.truncated_tool_results,
+                                )
+                                self.tracer.emit(
+                                    "context_compressed",
+                                    step_index=i,
+                                    original_tokens=comp.original_tokens,
+                                    final_tokens=comp.final_tokens,
+                                    saved_tokens=saved,
+                                    dropped_messages=comp.dropped_messages,
+                                    truncated_tool_results=comp.truncated_tool_results,
+                                    summary_tokens=comp.summary_tokens,
+                                )
+                        except Exception:
+                            logger.exception(
+                                "context compression failed; continuing with full context"
+                            )
                     # ── LLM 调用埋点 ──
                     t0 = time.time()
                     self.tracer.emit(
@@ -330,29 +436,40 @@ class CoreAgent:
                         n_messages=len(messages),
                         n_tools=len(tool_schemas),
                     )
+                    # 带重试llm调用
                     try:
-                        resp = self.llm.chat(
-                            messages=messages,
-                            tools=tool_schemas if tool_schemas else None,
-                            tool_choice="auto" if tool_schemas else None,
-                        )
+                        resp = self._call_llm_with_retry(messages, tool_schemas)
+                        self._circuit.record_success()
                     except Exception as e:
-                        logger.exception("LLM call failed")
+                        logger.exception("LLM call failed after retries")
+                        self._circuit.record_failure()
+
                         self.tracer.emit(
-                            "run_end",
-                            step_index=i,
-                            success=False,
-                            iterations=i + 1,
-                            error=f"llm_error: {e}",
-                        )
+                           "run_end",
+                          step_index=i,
+                          success=False,
+                          iterations=i + 1,
+                          error=f"llm_error: {e}",
+                    )
+
+                   # 先检查"熔断器"是否处于打开（open）状态。
+                   # 如果打开，说明系统已经判定当前服务/依赖不可用，直接快速失败返回，不再继续执行
+                        # 熔断检查
+                        if self._circuit.is_open():
+                            return AgentResult(
+                                success=False,
+                                answer=self._partial_answer(),
+                                steps=self.steps,
+                                iterations=i + 1,
+                                state=AgentState.ERROR,
+                                error=f"circuit_breaker_open: {e}",
+                                metadata={"circuit": self._circuit.snapshot()},
+                            )
                         return AgentResult(
-                            success=False,
-                            answer=f"LLM error: {e}",
-                            steps=self.steps,
-                            iterations=i + 1,
-                            state=AgentState.ERROR,
-                            error=str(e),
-                        )
+                             success=False, answer=f"LLM error: {e}",
+                             steps=self.steps, iterations=i + 1,
+                             state=AgentState.ERROR, error=str(e),
+                           )
 
                     llm_ms = (time.time() - t0) * 1000
 
@@ -395,6 +512,7 @@ class CoreAgent:
                                 "session_id": session_id,
                                 "usage": resp.get("usage", {}),
                                 "messages": messages,
+                                "compression_stats": dict(self._compression_stats), 
                             },
                         )
 
@@ -455,20 +573,49 @@ class CoreAgent:
                                 f"{json.dumps(action_input, ensure_ascii=False)[:200]}"
                             )
 
-                        observation = self._execute_tool(action_name, action_input)
+                        observation = self._execute_tool(action_name, action_input) 
+                           #是最原始的、工具直接返回的内容
+                        self.state = AgentState.OBSERVING
                         tool_ms = (time.time() - t0) * 1000
                         success = not str(observation).startswith("Error:")
 
-                        # ★ tool_result 事件
+                        # ★ Layer 2：失败时反馈给 circuit，并记录提示
+                        if success:
+                            self._circuit.record_success()
+                        else:
+                            self._circuit.record_failure()
+                            observation = (
+                                f"{observation}\n\n"
+                                f"[System] This is consecutive failure #{self._circuit.failure_count}. "
+                                f"Consider a different approach or tool."
+                              )
+
+                         # 把 tool 结果加进 messages  并且注意把"记录"动作提前到熔断判断之前
+                        step = AgentStep(
+                              thought=content or "",
+                              action=action_name,
+                              action_input=action_input,
+                              observation=str(observation),
+                              success=success,
+                              error=str(observation) if not success else None,)
+                        self.steps.append(step)
+                        
+                        messages.append({
+                             "role": "tool",
+                             "tool_call_id": call_id,
+                             "content": str(observation)   })
+                        
+                        
+                         # ★ tool_result 事件
                         self.tracer.emit(
-                            "tool_result",
-                            step_index=i,
-                            duration_ms=tool_ms,
-                            tool=action_name,
-                            call_id=call_id,
-                            success=success,
-                            result_preview=str(observation)[:200],
-                        )
+                                "tool_result",
+                                step_index=i,
+                                duration_ms=tool_ms,
+                                tool=action_name,
+                                call_id=call_id,
+                                success=success,
+                                result_preview=str(observation)[:200],
+                            )
                         if not success:
                             self.tracer.emit(
                                 "error",
@@ -476,32 +623,34 @@ class CoreAgent:
                                 phase="tool_call",
                                 tool=action_name,
                                 call_id=call_id,
-                                error=str(observation)[:500],
-                            )
+                                error=str(observation)[:500])
+                        
 
+                        # ★ Layer 3：熔断检查
+                        if self._circuit.is_open():
+                          logger.error(
+                          "circuit breaker open after %d consecutive failures",
+                         self._circuit.failure_count,
+                           )
+                          
+                          return AgentResult(
+                            success=False,
+                            answer=self._partial_answer(),
+                            steps=self.steps,
+                            iterations=i + 1,
+                            state=AgentState.ERROR,
+                            error="circuit_breaker_open",
+                            metadata={"circuit": self._circuit.snapshot()},
+                               )   
+                        
+                        if session_id:
+                            self._save_session_messages(session_id, messages)
+                       
                         if self.verbose:
                             obs_preview = str(observation)[:100]
                             logger.info(f"👁️ Observation: {obs_preview}")
 
-                        self.state = AgentState.OBSERVING
-
-                        step = AgentStep(
-                            thought=content or "",
-                            action=action_name,
-                            action_input=action_input,
-                            observation=str(observation),
-                            success=success,
-                            error=str(observation) if not success else None,
-                        )
-                        self.steps.append(step)
-
-                        # 把 tool 结果加进 messages
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": str(observation),
-                        })
-
+                
                         # 在线反思（不确定性驱动）
                         if self._should_reflect({
                             "step_index": i,
@@ -540,9 +689,8 @@ class CoreAgent:
                     reason="max_iterations_exceeded",
                     iterations=self.max_iterations,
                 )
-
                 if session_id:
-                    self._save_session_messages(session_id, messages)
+                     self._save_session_messages(session_id, messages)
 
                 return AgentResult(
                     success=False,
@@ -551,10 +699,18 @@ class CoreAgent:
                     iterations=self.max_iterations,
                     state=AgentState.ERROR,
                     error="max_iterations_exceeded",
+                    metadata={ "compression_stats": dict(self._compression_stats)},
                 )
-
+            
         finally:
             # ★ 无论怎么退出，都 flush trace
+            if session_id:                                  # ← 兜底保存（可选）
+                try:
+                    self._save_session_messages(session_id, messages)
+                except Exception:
+                    logger.exception("save session failed")
+
+
             if self.tracer is not None:
                 try:
                     self.tracer.shutdown()
@@ -621,7 +777,7 @@ class CoreAgent:
             f"  Step {i}: {s}" for i, s in enumerate(history[-5:])
         ) or "  (无)"
 
-        prompt = f"""你在执行一个 Agent 任务，刚刚某一步出了问题。请做一次简短的反思（80 字以内），重点是"下一步怎么改"。
+        prompt = f"""你在执行一个 Agent 任务,刚刚某一步出了问题。请做一次简短的反思(80 字以内)，重点是"下一步怎么改"。
 
 ## 用户目标
 {query}
@@ -722,6 +878,10 @@ class CoreAgent:
         self.state = AgentState.IDLE
         self.steps = []
         self.context = {}
+        self._compression_stats = {
+            "total_compressions": 0,
+            "total_tokens_saved": 0,
+        }
 
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
@@ -734,7 +894,14 @@ class CoreAgent:
             "enable_reflection": self.enable_reflection,
         }
 
-
+    def _partial_answer(self) -> str:
+        """熔断时返回部分答案：取最后一个非空 observation 或 thought"""
+        for step in reversed(self.steps):
+            if step.observation and not step.observation.startswith("Error:"):
+                return f"[partial] {step.observation}"
+            if step.thought:
+                return f"[partial] {step.thought}"
+        return "[partial] No usable result before circuit breaker opened."
 # ==================== 便捷函数 ====================
 
 def create_agent(
