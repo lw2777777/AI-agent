@@ -85,7 +85,6 @@ class CoreAgent:
         context_keep_recent: int = 4,
         enable_context_compression: bool = True,
         # ★ 新增：错误恢复
-        retry_policy: Optional[RetryPolicy] = None,
         name: str = "CoreAgent",
         llm: Optional[Any] = None,
         tools: Optional[List[Any]] = None,
@@ -121,6 +120,9 @@ class CoreAgent:
         self.context: Dict[str, Any] = {}
         self._reflector: Optional[Reflector] = None
         self.tracer = tracer or Tracer()
+        
+        self.llm_retry_policy = llm_retry_policy  or RetryPolicy()
+        self._circuit = CircuitBreaker(threshold=circuit_threshold)
 
         self.enable_context_compression = enable_context_compression
         self._context_manager = ContextManager(

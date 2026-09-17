@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .token_counter import estimate_messages_tokens, estimate_message_tokens
-from .context_manager import ContextManager
+
 logger = logging.getLogger(__name__)
 
 

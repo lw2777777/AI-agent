@@ -1,0 +1,112 @@
+{
+  "suite_name": "all",
+  "total": 7,
+  "passed": 7,
+  "failed": 0,
+  "avg_score": 1.0,
+  "pass_rate": 1.0,
+  "avg_steps": 2.0,
+  "avg_duration_s": 1.354372841971261,
+  "total_tokens": 5101,
+  "results": [
+    {
+      "task_id": "math_1",
+      "score": 1.0,
+      "success": true,
+      "actual_answer": "123 * 456 = 56088",
+      "expected": 56088,
+      "steps": 2,
+      "duration_s": 1.0978522300720215,
+      "tokens_prompt": 717,
+      "tokens_completion": 8,
+      "error": null,
+      "extra": {}
+    },
+    {
+      "task_id": "math_2",
+      "score": 1.0,
+      "success": true,
+      "actual_answer": "(10 + 20) * 3 = 90",
+      "expected": 90,
+      "steps": 2,
+      "duration_s": 1.4861829280853271,
+      "tokens_prompt": 733,
+      "tokens_completion": 12,
+      "error": null,
+      "extra": {}
+    },
+    {
+      "task_id": "math_3",
+      "score": 1.0,
+      "success": true,
+      "actual_answer": "2 的 10 次方等于 1024。",
+      "expected": 1024,
+      "steps": 2,
+      "duration_s": 1.1365046501159668,
+      "tokens_prompt": 733,
+      "tokens_completion": 13,
+      "error": null,
+      "extra": {}
+    },
+    {
+      "task_id": "tool_1",
+      "score": 1.0,
+      "success": true,
+      "actual_answer": "5 + 5 = 10",
+      "expected": "calculate",
+      "steps": 2,
+      "duration_s": 1.3545558452606201,
+      "tokens_prompt": 716,
+      "tokens_completion": 7,
+      "error": null,
+      "extra": {}
+    },
+    {
+      "task_id": "tool_2",
+      "score": 1.0,
+      "success": true,
+      "actual_answer": "格式化结果：\n\n```json\n{\n  \"a\": 1,\n  \"b\": 2\n}\n```",
+      "expected": "format_json",
+      "steps": 2,
+      "duration_s": 1.2840640544891357,
+      "tokens_prompt": 717,
+      "tokens_completion": 23,
+      "error": null,
+      "extra": {}
+    },
+    {
+      "task_id": "clean_1",
+      "score": 1.0,
+      "success": true,
+      "actual_answer": "100 / 4 = 25",
+      "expected": "",
+      "steps": 2,
+      "duration_s": 1.5090789794921875,
+      "tokens_prompt": 718,
+      "tokens_completion": 7,
+      "error": null,
+      "extra": {}
+    },
+    {
+      "task_id": "clean_2",
+      "score": 1.0,
+      "success": true,
+      "actual_answer": "现在是 2026年9月17日 19:57:51（北京时间，CST）。",
+      "expected": "",
+      "steps": 2,
+      "duration_s": 1.6123712062835693,
+      "tokens_prompt": 676,
+      "tokens_completion": 21,
+      "error": null,
+      "extra": {}
+    }
+  ],
+  "by_tag": {
+    "all": {
+      "n": 7.0,
+      "avg_score": 1.0,
+      "pass_rate": 1.0
+    }
+  },
+  "metadata": {}
+}

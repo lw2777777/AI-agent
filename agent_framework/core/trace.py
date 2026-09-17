@@ -3,7 +3,7 @@
 Trace - 基于 OpenTelemetry 的结构化执行追踪（写法 C 版本）
 
 设计要点:
-1. 一次 run = 一棵 trace 树：root span 由 `Tracer.trace()` 上下文管理器创建/结束
+1. 一次 run = 一棵 trace 树: root span 由 `Tracer.trace()` 上下文管理器创建/结束
 2. `emit` / `span` 内部用 `start_as_current_span`，自动认"当前 span"为父
 3. 保留原有 JSON events 导出，向后兼容
 4. GenAI semantic conventions 自动映射
@@ -94,7 +94,7 @@ class TraceEvent:
 
 
 # ══════════════════════════════════════════════════════════
-# Tracer（写法 C）
+#         Tracer
 # ══════════════════════════════════════════════════════════
 class Tracer:
     """
