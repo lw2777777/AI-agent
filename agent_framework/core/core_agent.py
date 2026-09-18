@@ -80,6 +80,7 @@ class CoreAgent:
         self,
         llm_retry_policy: Optional[RetryPolicy] = None,
         circuit_threshold: int = 5,
+        memory_manager: Optional[Any] = None,
     # ★ 新增：上下文压缩
         context_max_tokens: int = 8000,
         context_keep_recent: int = 4,
@@ -110,7 +111,7 @@ class CoreAgent:
         self.name = name
         self.llm = llm
         self.tools = self._index_tools(tools or [])
-        self.memory_store = memory_store or ArchivalMemoryStore()
+        self.memory_store = memory_store 
         self.max_iterations = max_iterations
         self.enable_reflection = enable_reflection
         self.verbose = verbose
@@ -130,6 +131,8 @@ class CoreAgent:
             keep_recent=context_keep_recent,
             llm=self._make_summary_llm(llm),  # ★ 带重试的包装
         )
+        self.memory_manager = memory_manager
+
     # 压缩统计
         self._compression_stats = {
            "total_compressions": 0,
@@ -260,28 +263,46 @@ class CoreAgent:
 
         return "\n".join(lines)
 
-    def _get_memory_context(self, query: str) -> str:
+    def _get_memory_context(self, query: str, current_thought: str = "") -> str:
         """获取记忆上下文"""
-        if not self.memory_store:
-            return ""
+      
+        ctx = self.memory_manager.retrieve_for_decision(
+           symbol=self.context.get("symbol", ""),
+           regime=self.context.get("regime", "unknown"),
+           signal_types=self.context.get("signal_types", []),
+           query=f"{query} {current_thought}".strip(),
+           top_k=5,
+           agent_id=self.name,
+         )
 
-        memories = self.memory_store.search(
-            query=query,
-            k=3,
-            agent_id=self.name,
-        )
+        parts = []
 
-        if not memories:
-            return ""
+        if ctx["strategy"]:
+           parts.append("## Strategy Experience (current regime)")
+           for s in ctx["strategy"]:
+               parts.append(
+                  f"- {s['signal_type']}: n={s['n_trades']} "
+                  f"win_rate={s['win_rate']:.2f} "
+                  f"avg_pnl={s['avg_pnl']:.4f} "
+                  f"sharpe_like={s['sharpe_like']:.2f}"
+               )
 
-        lines = ["## Relevant Memories"]
-        for mem in memories:
-            lines.append(
-                f"- {mem['content'][:150]}... (importance: {mem['importance']:.2f})"
-            )
+        if ctx["episodic"]:
+            parts.append("\n## Similar Past Trades")
+            for e in ctx["episodic"][:3]:
+                parts.append(
+                    f"- {e['symbol']} {e['action']} @ {e['entry_time']} "
+                    f"→ {e['exit_reason']} pnl_pct={e.get('pnl_pct', 0):.4f}"
+               )
 
-        return "\n".join(lines)
+        if ctx["semantic"]:
+            parts.append("\n## Relevant Lessons")
+            for m in ctx["semantic"][:3]:
+                parts.append(f"- {m['content'][:200]}")
 
+        return "\n".join(parts)
+
+       
 
     def _call_llm_with_retry(self, messages, tool_schemas):
         """Layer 1: LLM 调用带重试"""
@@ -467,11 +488,13 @@ class CoreAgent:
                                 error=f"circuit_breaker_open: {e}",
                                 metadata={"circuit": self._circuit.snapshot()},
                             )
-                        return AgentResult(
+                        result = AgentResult(
                              success=False, answer=f"LLM error: {e}",
                              steps=self.steps, iterations=i + 1,
                              state=AgentState.ERROR, error=str(e),
                            )
+                        self._finalize(result, query, session_id)
+                        return result
 
                     llm_ms = (time.time() - t0) * 1000
 
@@ -515,8 +538,7 @@ class CoreAgent:
                                 "usage": resp.get("usage", {}),
                                 "messages": messages,
                                 "compression_stats": dict(self._compression_stats), 
-                            },
-                        )
+                            } )
 
                         # ★ trace: 完成
                         self.tracer.emit(
@@ -635,7 +657,7 @@ class CoreAgent:
                          self._circuit.failure_count,
                            )
                           
-                          return AgentResult(
+                          result= AgentResult(
                             success=False,
                             answer=self._partial_answer(),
                             steps=self.steps,
@@ -644,6 +666,9 @@ class CoreAgent:
                             error="circuit_breaker_open",
                             metadata={"circuit": self._circuit.snapshot()},
                                )   
+                          
+                          self._finalize(result, query, session_id)
+                          return result
                         
                         if session_id:
                             self._save_session_messages(session_id, messages)
@@ -694,7 +719,7 @@ class CoreAgent:
                 if session_id:
                      self._save_session_messages(session_id, messages)
 
-                return AgentResult(
+                result = AgentResult(
                     success=False,
                     answer="Reached maximum iterations",
                     steps=self.steps,
@@ -703,6 +728,8 @@ class CoreAgent:
                     error="max_iterations_exceeded",
                     metadata={ "compression_stats": dict(self._compression_stats)},
                 )
+                self._finalize(result, query, session_id)
+                return result
             
         finally:
             # ★ 无论怎么退出，都 flush trace
@@ -719,6 +746,50 @@ class CoreAgent:
                 except Exception:
                     logger.exception("Tracer shutdown failed")
 
+
+    def _finalize(self, result: AgentResult, query: str, session_id: Optional[str]):
+        """任务结束时，写回记忆"""
+        if not self.memory_manager:
+            return
+
+    # Layer 2: 不在这里写，由 Orchestrator 在平仓时写
+    # Layer 3 (semantic): 写"任务级摘要"
+        try:
+            if result.success:
+                content = f"Task succeeded: {query[:100]}. Answer: {result.answer[:200]}"
+                importance = 0.6
+            else:
+                content = f"Task failed: {query[:100]}. Error: {result.error}"
+                importance = 0.8
+
+            self.memory_store.save(
+               content=content,
+               agent_id=self.name,
+               memory_type="task",
+               metadata={
+                   "session_id": session_id,
+                   "success": result.success,
+                   "iterations": result.iterations,
+                 },
+               importance=importance,
+             )
+        except Exception:
+            logger.exception("task memory write failed")
+
+    # Layer 3 (semantic): 写反思
+        if result.reflection:
+            try:
+                 for lesson in getattr(result.reflection, "lessons", []):
+                    self.memory_store.save(
+                        content=lesson,
+                        agent_id=self.name,
+                        memory_type="lesson",
+                        metadata={"query": query},
+                        importance=0.9,
+                    )
+            except Exception:
+              logger.exception("reflection memory write failed")
+    
     # ─────────────────────────────────────────────
     # 反思相关
     # ─────────────────────────────────────────────
