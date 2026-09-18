@@ -1,8 +1,8 @@
 
 """
-对比两次批量回测报告。
-
-回答:"我的改动让 Agent 变好还是变差?"
+对比两次量化回测报告。
+用法:
+    python3 eval/backtest_compare.py baseline.json v2.json
 """
 from __future__ import annotations
 import json
@@ -18,7 +18,6 @@ def compare(baseline: Dict, candidate: Dict) -> Dict[str, Any]:
     b_agg = baseline["aggregate"]
     c_agg = candidate["aggregate"]
 
-    # ── 汇总差异 ──
     summary_delta = {
         "avg_return":     c_agg["avg_return"]     - b_agg["avg_return"],
         "avg_sharpe":     c_agg["avg_sharpe"]     - b_agg["avg_sharpe"],
@@ -29,52 +28,46 @@ def compare(baseline: Dict, candidate: Dict) -> Dict[str, Any]:
         "std_return":     c_agg["std_return"]     - b_agg["std_return"],
     }
 
-    # ── 分标的差异 ──
     b_syms = baseline["per_symbol"]
     c_syms = candidate["per_symbol"]
-    per_symbol_delta: Dict[str, Dict[str, float]] = {}
-    regressions: List[Dict[str, Any]] = []
-    improvements: List[Dict[str, Any]] = []
+    per_symbol_delta = {}
+    regressions = []
+    improvements = []
 
     for sym in set(b_syms) & set(c_syms):
         b = b_syms[sym]
         c = c_syms[sym]
         if "error" in b or "error" in c:
             continue
-
         d = {
-            "return":     c["total_return"]  - b["total_return"],
-            "sharpe":     c["sharpe"]        - b["sharpe"],
-            "drawdown":   c["max_drawdown"]  - b["max_drawdown"],
-            "trades":     c["total_trades"]  - b["total_trades"],
-            "win_rate":   c["win_rate"]      - b["win_rate"],
+            "return":   c["total_return"]  - b["total_return"],
+            "sharpe":   c["sharpe"]        - b["sharpe"],
+            "drawdown": c["max_drawdown"]  - b["max_drawdown"],
+            "trades":   c["total_trades"]  - b["total_trades"],
+            "win_rate": c["win_rate"]      - b["win_rate"],
         }
         per_symbol_delta[sym] = d
 
-        # 判回归
         if d["return"] < -0.02 or d["drawdown"] > 0.03:
             regressions.append({
-                "symbol": sym,
-                "return_delta": d["return"],
-                "drawdown_delta": d["drawdown"],
-                "sharpe_delta": d["sharpe"],
+                "symbol": sym, "return_delta": d["return"],
+                "drawdown_delta": d["drawdown"], "sharpe_delta": d["sharpe"],
             })
         elif d["return"] > 0.02 and d["drawdown"] < 0.01:
             improvements.append({
-                "symbol": sym,
-                "return_delta": d["return"],
+                "symbol": sym, "return_delta": d["return"],
                 "sharpe_delta": d["sharpe"],
             })
 
     return {
-        "baseline_tag":  baseline["config"]["tag"],
+        "baseline_tag": baseline["config"]["tag"],
         "candidate_tag": candidate["config"]["tag"],
-        "baseline_notes":  baseline["config"].get("notes", ""),
+        "baseline_notes": baseline["config"].get("notes", ""),
         "candidate_notes": candidate["config"].get("notes", ""),
-        "summary_delta":  summary_delta,
+        "summary_delta": summary_delta,
         "per_symbol_delta": per_symbol_delta,
-        "regressions":   regressions,
-        "improvements":  improvements,
+        "regressions": regressions,
+        "improvements": improvements,
     }
 
 
@@ -83,21 +76,20 @@ def print_comparison(diff: Dict) -> None:
     print(f"  Compare: {diff['baseline_tag']} → {diff['candidate_tag']}")
     print(f"{'='*60}")
     if diff["baseline_notes"]:
-        print(f"  baseline: {diff['baseline_notes']}")
+        print(f"  baseline:  {diff['baseline_notes']}")
     if diff["candidate_notes"]:
         print(f"  candidate: {diff['candidate_notes']}")
 
     d = diff["summary_delta"]
     def _arrow(v, good_positive=True):
-        if abs(v) < 1e-6: return "  "
-        good = (v > 0) == good_positive
-        return "✅" if good else "⚠️"
+        if abs(v) < 1e-6:
+            return "  "
+        return "✅" if (v > 0) == good_positive else "⚠️"
 
     print(f"\n  avg_return     Δ: {d['avg_return']*100:+.2f}%   {_arrow(d['avg_return'])}")
     print(f"  avg_sharpe     Δ: {d['avg_sharpe']:+.3f}      {_arrow(d['avg_sharpe'])}")
     print(f"  avg_win_rate   Δ: {d['avg_win_rate']*100:+.2f}%   {_arrow(d['avg_win_rate'])}")
     print(f"  avg_trades     Δ: {d['avg_trades']:+.1f}      {_arrow(d['avg_trades'], good_positive=False)}")
-    # drawdown 越大越差
     print(f"  worst_drawdown Δ: {d['worst_drawdown']*100:+.2f}%   {_arrow(d['worst_drawdown'], good_positive=False)}")
     print(f"  std_return     Δ: {d['std_return']*100:+.2f}%   {_arrow(d['std_return'], good_positive=False)}")
 
@@ -106,32 +98,24 @@ def print_comparison(diff: Dict) -> None:
         for r in diff["regressions"]:
             print(f"    - {r['symbol']}: return={r['return_delta']*100:+.2f}%, "
                   f"dd={r['drawdown_delta']*100:+.2f}%, sharpe={r['sharpe_delta']:+.3f}")
-
     if diff["improvements"]:
         print(f"\n  🟢 Improvements ({len(diff['improvements'])}):")
         for i in diff["improvements"]:
             print(f"    - {i['symbol']}: return={i['return_delta']*100:+.2f}%, "
                   f"sharpe={i['sharpe_delta']:+.3f}")
-
     print(f"{'='*60}\n")
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("baseline", help="baseline JSON 路径")
-    parser.add_argument("candidate", help="candidate JSON 路径")
-    parser.add_argument("--json-out", default=None, help="同时输出对比为 JSON")
+    parser.add_argument("baseline")
+    parser.add_argument("candidate")
     args = parser.parse_args()
 
     b = load_report(args.baseline)
     c = load_report(args.candidate)
-    diff = compare(b, c)
-    print_comparison(diff)
-
-    if args.json_out:
-        Path(args.json_out).write_text(json.dumps(diff, indent=2, ensure_ascii=False))
-        print(f"Saved diff: {args.json_out}")
+    print_comparison(compare(b, c))
 
 
 if __name__ == "__main__":

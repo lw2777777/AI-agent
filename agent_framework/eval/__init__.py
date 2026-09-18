@@ -9,12 +9,11 @@ from .evaluator import (
     Evaluator,
 )
 from .scorers import (
-    exact_match,
-    contains_match,
-    numeric_close,
-    llm_judge,
-    tool_called,
-    no_error,
+     exact_match,    contains_match,
+     numeric_close,  llm_judge,
+     tool_called,    no_error,
+     graceful_error, no_hallucination, 
+     answer_in_range, 
 )
 
 __all__ = [
