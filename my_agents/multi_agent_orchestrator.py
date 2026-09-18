@@ -5,7 +5,7 @@ MultiAgentOrchestrator: 协调 alpha / market / execution / risk 四个 Agent
   1. MarketAgent 先跑 → 输出市场状态特征
   2. AlphaAgent、RiskAgent 并行跑
   3. 投票：
-     - Alpha 投方向票（BUY/SELL/HOLD）
+     - Alpha 投方向票(BUY/SELL/HOLD)
      - Market 提供 regime 调整系数（不投票）
      - Risk 提供风险等级调整系数（不投票）
   4. ExecutionAgent 做参数转换（止损/止盈/仓位）
@@ -16,6 +16,7 @@ MultiAgentOrchestrator: 协调 alpha / market / execution / risk 四个 Agent
   - 置信度计算修正：避免过度压制
   - 权重学习修正：只对方向票计分
   - RiskAgent 集成修正：传入组合状态
+  - 已禁用做空: SELL 仅用于平多，不再开空
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ from .alpha_agent import AlphaAgent
 from .base_agent import Action, AgentOutput, MarketRegime, RiskLevel
 from .execution_agent import ExecutionAgent
 from .market_agent import MarketAgent
-from .reflexion_engine import ReflexionEngine  
+from .reflexion_engine import ReflexionEngine
 from .risk_agent import RiskAgent
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,8 @@ class MultiAgentOrchestrator:
         self.learning_rate = float(cfg.get("learning_rate", 0.1))
         self.min_samples_to_learn = int(cfg.get("min_samples_to_learn", 20))
 
+        self.memory = MemoryManager()
+        self._current_episode_id: Optional[str] = None
         # 状态
         self._alpha_weight = 1.0  # AlphaAgent 的可信度权重（动态调整）
         self._weight_lock = threading.Lock()
@@ -165,9 +168,6 @@ class MultiAgentOrchestrator:
                 ),
            )
 
-
-        
-
         # ══════════════════════════════════════
         # Stage 2: AlphaAgent、RiskAgent 并行
         # ══════════════════════════════════════
@@ -175,7 +175,7 @@ class MultiAgentOrchestrator:
         risk_ctx = {
             "portfolio": portfolio,
             "portfolio_state": portfolio_state,
-            "portfolio_prices": {symbol: price},  
+            "portfolio_prices": {symbol: price},
         }
 
         with ThreadPoolExecutor(max_workers=2) as ex:
@@ -192,6 +192,25 @@ class MultiAgentOrchestrator:
             alpha_out, market_out, risk_out
         )
 
+        # ★ strategy memory 调整置信度
+        regime = market_features.get("regime", "unknown")   # 你文件里其实已有了
+        signal_types = self._extract_signal_types(alpha_out)
+
+        mem_ctx = self.memory.retrieve_for_decision(
+               symbol=symbol,
+               regime=regime,
+               signal_types=signal_types,
+               query=f"{symbol} {regime}",
+               top_k=5,
+             )
+
+        if final_action != ACTION_HOLD and signal_types:
+            signal_types = self._extract_signal_types(alpha_out)  # 已排序
+            reflexion_mult, reasons = self.reflexion.get_confidence_multiplier(
+                regime=regime,
+                signal_types=signal_types,   # ★ 传完整列表，reflexion 内部会遍历+按样本量加权
+                hour=market_features.get("hour"),  )
+        
         # ── P1-3：Reflexion 置信度乘子 ──────────
         # 只对方向票生效（HOLD 不用乘）
         if final_action != ACTION_HOLD:
@@ -218,40 +237,28 @@ class MultiAgentOrchestrator:
                 portfolio_state["total_value"]
             )
 
-        
-         # ══════════════════════════════════════════════════
-        # ★ 新增 Stage 3.5：强制平仓优先
+        # ══════════════════════════════════════════════════
+        # ★ Stage 3.5：强制平仓优先（仅多头）
         # ══════════════════════════════════════════════════
         risk_gate = risk_out.features.get("risk_gate", "clear")
 
-        is_force_close = False 
+        is_force_close = False
         if risk_gate == "force_close":
-            # 当前有持仓 → 发反向信号平仓
-            has_long  = any(p.get("shares", 0) > 0 for p in portfolio.values())
-            has_short = any(p.get("shares", 0) < 0 for p in portfolio.values())
+            # 当前有持仓 → 发反向信号平仓（仅多头）
+            has_long = any(p.get("shares", 0) > 0 for p in portfolio.values())
 
             if has_long:
                 final_action = ACTION_SELL
                 final_confidence = 1.0
-                is_force_close = True 
+                is_force_close = True
                 logger.warning(
                     "[%s] FORCE_CLOSE triggered → close long via SELL", symbol
-                )
-            elif has_short:
-                final_action = ACTION_BUY
-                final_confidence = 1.0
-                is_force_close = True 
-                logger.warning(
-                    "[%s] FORCE_CLOSE triggered → close short via BUY", symbol
                 )
             else:
                 # 无持仓，忽略强平
                 final_action = ACTION_HOLD
                 final_confidence = 0.0
 
-        
-
-        
         # ══════════════════════════════════════
         # Stage 4: ExecutionAgent 参数转换
         # ══════════════════════════════════════
@@ -271,7 +278,7 @@ class MultiAgentOrchestrator:
 
         else:
             # ══════════════════════════════════════════════════
-            # ★ 新增：区分"开仓"和"平仓"
+            # ★ 区分"开仓"和"平仓"（仅多头）
             # ══════════════════════════════════════════════════
             is_opening = self._is_opening_signal(final_action, portfolio)
             is_closing = self._is_closing_signal(final_action, portfolio)
@@ -284,7 +291,24 @@ class MultiAgentOrchestrator:
                     "[%s] closing signal %s, bypass risk_gate",
                     symbol, final_action,
                 )
-        
+                # ★ 这里：平仓 episode
+                if self._current_episode_id is not None:
+                    self.memory.close_trade(
+                    episode_id=self._current_episode_id,
+                    exit_time=pd.Timestamp.now().isoformat(),
+                    exit_price=price,
+                    exit_reason="signal",
+                    symbol=symbol,
+                    regime=regime,
+                    signal_types=self._extract_signal_types(alpha_out), 
+                    pnl=None,                          # 平仓时还不知道真实盈亏 → 先 None
+                    pnl_pct=None,                      # 同上
+                    max_drawdown=0.0,                  # 同上，事后补
+                    holding_bars=None,                 # 事后补，或现在算
+                    reflection=None,                   # 事后由 reflexion.reflect() 补
+                    lesson=None,  )                     # 同上
+                    self._current_episode_id = None
+                    logger.info("[%s] Closed episode via closing signal", symbol)
             else:
                 # 开仓信号：读 RiskAgent 的闸门
                 risk_gate = risk_out.features.get("risk_gate", "clear")
@@ -297,7 +321,7 @@ class MultiAgentOrchestrator:
                     )
                     final_action = ACTION_HOLD
                     final_confidence = 0.0
-            
+
             if final_action == ACTION_HOLD:
                   # 被 RiskAgent 否决后，改成 HOLD 输出
                    exec_out = AgentOutput(
@@ -330,6 +354,40 @@ class MultiAgentOrchestrator:
                     )
                     final_action = ACTION_HOLD
                     final_confidence = 0.0
+
+
+
+                # ★ Stage 4.5：开仓 episode 记录（仅新开仓）
+        if (
+            final_action != ACTION_HOLD
+            and is_opening                       # ★ 关键：只在新开仓时记
+            and not self._current_episode_id     # 防止重复开
+        ):
+            signal_types = self._extract_signal_types(alpha_out)
+            self._current_episode_id = self.memory.open_trade(
+                symbol=symbol,
+                regime=regime,
+                signal_types=signal_types,
+                action=final_action,
+                entry_time=pd.Timestamp.now().isoformat(),
+                entry_price=float(exec_out.features.get("entry", price)),
+                position_size=float(exec_out.features.get("position_size", 0)),
+                agent_votes={
+                    "alpha": alpha_out.action.value,
+                    "market": market_out.action.value,
+                    "risk": risk_out.action.value,
+                    "execution": exec_out.action.value,
+                },
+                agent_confidences={
+                    "alpha": round(alpha_out.confidence, 4),
+                    "market": round(market_out.confidence, 4),
+                    "risk": round(risk_out.confidence, 4),
+                    "execution": round(exec_out.confidence, 4),
+                },
+                market_features=market_features,
+            )
+            logger.info("[%s] Opened episode: %s", symbol, self._current_episode_id)
+
 
         # ══════════════════════════════════════
         # 组装 Decision
@@ -414,7 +472,7 @@ class MultiAgentOrchestrator:
     def reset_risk_state_after_close(self, current_cash: float) -> None:
         """ FORCE_CLOSE 平仓后调用，重置 RiskAgent 的累计回撤状态。
                 避免"回撤超限 → 强平 → 空仓仍超限 → 再强平"的死循环。
-    
+
                 Args:
                     current_cash: 平仓后的当前现金（作为新的 peak_value 基准）
         """
@@ -451,7 +509,7 @@ class MultiAgentOrchestrator:
             "avg_return": round(avg_return, 6),
             "win_rate": round(win_rate, 4),
             "alpha_weight": round(alpha_weight, 4),
-            "reflexion": self.reflexion.get_performance_summary(),  
+            "reflexion": self.reflexion.get_performance_summary(),
         }
 
     # ══════════════════════════════════════
@@ -472,7 +530,7 @@ class MultiAgentOrchestrator:
             confidence=0.0,
             warnings=[f"{name} failed"],
         )
-    
+
     @staticmethod
     def _risk_gate_to_size_mult(gate: str) -> float:
         """
@@ -485,7 +543,7 @@ class MultiAgentOrchestrator:
             "clear": 1.0,
             "reduce": 0.5,
             "block": 0.0,
-            "force_close": 1.0,   
+            "force_close": 1.0,
         }.get(str(gate).lower(), 1.0)
 
     def _vote(
@@ -519,7 +577,7 @@ class MultiAgentOrchestrator:
         regime = market.features.get("regime", MarketRegime.UNKNOWN.value)
         regime_mult = {
             MarketRegime.TRENDING_UP.value: 1.2,       # 趋势上涨：增强做多
-            MarketRegime.TRENDING_DOWN.value: 1.2,     # 趋势下跌：增强做空
+            MarketRegime.TRENDING_DOWN.value: 1.2,     # 趋势下跌：增强看跌
             MarketRegime.RANGING.value: 0.8,           # 震荡：降低方向性
             MarketRegime.VOLATILE.value: 0.8,          # 波动剧烈：大幅降低
             MarketRegime.BREAKOUT.value: 1.3,          # 突破：增强
@@ -550,53 +608,33 @@ class MultiAgentOrchestrator:
         # ─ 最终置信度 ─────────────────────────
         final_confidence = alpha_conf * regime_mult * risk_mult * alpha_weight
         final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
-        
-        
+
         # ─ 阈值检查 ───────────────────────────
         if final_confidence < self.voting_threshold or alpha_action == ACTION_HOLD:
             return ACTION_HOLD, round(final_confidence, 4)
 
         return alpha_action, round(final_confidence, 4)
 
-
-
     # ══════════════════════════════════════
-    # 辅助：判断开仓 / 平仓
+    # 辅助：判断开仓 / 平仓（仅多头）
     # ══════════════════════════════════════
     @staticmethod
     def _is_opening_signal(action: str, portfolio: Dict[str, Dict[str, Any]]) -> bool:
-        """判断信号是否是"新开仓"：空仓 BUY 或 空仓 SELL"""
-        has_long  = any(p.get("shares", 0) > 0 for p in portfolio.values())
-        has_short = any(p.get("shares", 0) < 0 for p in portfolio.values())
+        """判断信号是否是"新开仓"：空仓 BUY"""
+        has_long = any(p.get("shares", 0) > 0 for p in portfolio.values())
 
         if action == ACTION_BUY:
             return not has_long
-        if action == ACTION_SELL:
-            return not has_short
         return False
 
     @staticmethod
     def _is_closing_signal(action: str, portfolio: Dict[str, Dict[str, Any]]) -> bool:
-        """判断信号是否是"平仓"：持多 SELL 或 持空 BUY"""
-        has_long  = any(p.get("shares", 0) > 0 for p in portfolio.values())
-        has_short = any(p.get("shares", 0) < 0 for p in portfolio.values())
+        """判断信号是否是"平仓"：持多 SELL"""
+        has_long = any(p.get("shares", 0) > 0 for p in portfolio.values())
 
         if action == ACTION_SELL:
             return has_long
-        if action == ACTION_BUY:
-            return has_short
         return False
-
-    @staticmethod
-    def _risk_gate_to_size_mult(gate: str) -> float:
-        """把 risk_gate 映射成仓位乘数"""
-        return {
-            "clear":  1.0,
-            "reduce": 0.5,
-            "block":  0.0,
-        }.get(str(gate).lower(), 1.0)
-
-    
 
     @staticmethod
     def _extract_signal_types(alpha_out: AgentOutput) -> List[str]:
@@ -633,8 +671,8 @@ class MultiAgentOrchestrator:
 
         规则：
           - 只有方向票（BUY/SELL）才参与学习
-          - 做多正收益 or 做空负收益 → 正样本
-          - 做多负收益 or 做空正收益 → 负样本
+          - 做多正收益 or 看跌负收益 → 正样本
+          - 做多负收益 or 看跌正收益 → 负样本
           - 使用贝叶斯平滑后的胜率更新权重
         """
         with self._history_lock:
@@ -685,8 +723,6 @@ class MultiAgentOrchestrator:
             old_weight, new_weight, win_rate * 100, total
         )
 
-
-       
     def _reflect_on_decision(
         self,
         decision: Decision,
@@ -740,4 +776,3 @@ class MultiAgentOrchestrator:
             risk_level=RiskLevel.MEDIUM.value,
             reasons=[reason],
         )
-
