@@ -48,6 +48,7 @@ class EvalResult:
     tokens_prompt: int = 0
     tokens_completion: int = 0
     error: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -197,6 +198,7 @@ class Evaluator:
                 tokens_prompt=tokens_prompt,
                 tokens_completion=tokens_completion,
                 error=agent_result.error,
+                tags=task.tags, 
             )
 
         except Exception as e:
@@ -231,9 +233,8 @@ class Evaluator:
         by_tag: Dict[str, Dict[str, float]] = {}
         tag_buckets: Dict[str, List[EvalResult]] = {}
         for r in results:
-            # 从 task 里继承 tags；这里简化：EvalResult.extra 里不放，直接按 id 前缀
-            tag = "all"
-            tag_buckets.setdefault(tag, []).append(r)
+            for tag in (r.tags or ["untagged"]):
+                tag_buckets.setdefault(tag, []).append(r)
 
         for tag, bucket in tag_buckets.items():
             by_tag[tag] = {
