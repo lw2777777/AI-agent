@@ -17,13 +17,15 @@ import json
 import logging
 from datetime import datetime
 
-from .archival_memory import ArchivalMemoryStore
+from .memory.semantic_memory import ArchivalMemoryStore
 from .reflector import Reflector, ReflectionResult
 from .trace import Tracer
 import time
 from .context_manager import ContextManager
 from .retry import RetryPolicy, retry_call
 from .circuit_breaker import CircuitBreaker
+from .error_recovery import ErrorRecovery, RecoveryAction
+
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,7 @@ class CoreAgent:
         self,
         llm_retry_policy: Optional[RetryPolicy] = None,
         circuit_threshold: int = 5,
+        guardrails: Optional[Any] = None,
         memory_manager: Optional[Any] = None,
     # ★ 新增：上下文压缩
         context_max_tokens: int = 8000,
@@ -124,6 +127,7 @@ class CoreAgent:
         
         self.llm_retry_policy = llm_retry_policy  or RetryPolicy()
         self._circuit = CircuitBreaker(threshold=circuit_threshold)
+        self.guardrails = guardrails  
 
         self.enable_context_compression = enable_context_compression
         self._context_manager = ContextManager(
@@ -132,6 +136,12 @@ class CoreAgent:
             llm=self._make_summary_llm(llm),  # ★ 带重试的包装
         )
         self.memory_manager = memory_manager
+
+        self.error_recovery = ErrorRecovery(
+            fallback_models=kwargs.get("fallback_models", []),
+            fallback_tools=kwargs.get("fallback_tools", {}),
+            on_degrade=lambda partial: self._partial_answer(),
+       )
 
     # 压缩统计
         self._compression_stats = {
@@ -324,20 +334,40 @@ class CoreAgent:
     # 工具执行
     # ─────────────────────────────────────────────
     def _execute_tool(self, name: str, inputs: Dict) -> str:
+        # ★ Layer 0: guardrails
+        if self.guardrails is not None:
+            verdict = self.guardrails.check(
+                tool_name=name,
+                arguments=inputs,
+                session_id=self.context.get("session_id"),
+            )
+            if not verdict.allowed:
+                logger.warning(
+                    "Guardrail blocked %s [%s]: %s",
+                    name, verdict.risk_level.value, verdict.reason,
+                )
+
+                return (
+                    f"Error: blocked by guardrail "
+                    f"[{verdict.risk_level.value}]: {verdict.reason}"
+                )
+            # 允许改写参数（如路径规范化）
+            if verdict.modified_args is not None:
+                inputs = verdict.modified_args
+
+        # 原有逻辑
         tool = self.tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found"
         try:
-            handler = getattr(tool, "handler", None)
+            handler = getattr(tool, 'handler', None)
             if handler is None:
-                # 工具本身是 callable
                 handler = tool
             result = handler(**inputs)
             return str(result)
         except Exception as e:
             logger.exception(f"Tool {name} failed")
             return f"Error: {type(e).__name__}: {str(e)}"
-
     # ─────────────────────────────────────────────
     # 主入口
     # ─────────────────────────────────────────────
@@ -420,9 +450,7 @@ class CoreAgent:
                     # ══════════════════════════════════════════════
                     if self.enable_context_compression:
                         try:
-                            comp = self._context_manager.compress(
-                                messages, task=query,
-                            )
+                            comp = self._context_manager.compress(messages, task=query)
                             if comp.compressed:
                                 messages = comp.messages
                                 self._compression_stats["total_compressions"] += 1
@@ -460,55 +488,94 @@ class CoreAgent:
                         n_tools=len(tool_schemas),
                     )
                     # 带重试llm调用
+        
                     try:
-                        resp = self._call_llm_with_retry(messages, tool_schemas)
-                        self._circuit.record_success()
+                         resp = self._call_llm_with_retry(messages, tool_schemas)
+                         self._circuit.record_success()
                     except Exception as e:
-                        logger.exception("LLM call failed after retries")
-                        self._circuit.record_failure()
+                         logger.exception("LLM call failed after retries")
+                         self._circuit.record_failure()
 
-                        self.tracer.emit(
-                           "run_end",
-                          step_index=i,
-                          success=False,
-                          iterations=i + 1,
-                          error=f"llm_error: {e}",
-                    )
+                         decision = self.error_recovery.decide(
+                             e, context={"step_index": i, "model": getattr(self.llm, "model", None)}
+                         )
+                         self.tracer.emit("error_recovery", step_index=i,
+                                     action=decision.action.value, reason=decision.reason)
 
+                         if decision.action == RecoveryAction.RETRY:
+                           continue   # 重试本轮
+
+                         if decision.action == RecoveryAction.FALLBACK_MODEL:
+                           self._swap_model(decision.fallback_model)
+                           continue
+
+                         if decision.action == RecoveryAction.DEGRADE:
+                             result = AgentResult(
+                               success=False,
+                               answer=self.error_recovery.degrade(self._partial_answer()),
+                               steps=self.steps, iterations=i + 1,
+                               state=AgentState.ERROR, error=str(e),
+                           ) 
+                             self._finalize(result, query, session_id)
+
+                             self.tracer.emit(
+                                "run_end",
+                                step_index=i,
+                                success=False,
+                                iterations=i + 1,
+                                error=f"llm_error: {e}",
+                              )
+                             return result
                    # 先检查"熔断器"是否处于打开（open）状态。
                    # 如果打开，说明系统已经判定当前服务/依赖不可用，直接快速失败返回，不再继续执行
                         # 熔断检查
-                        if self._circuit.is_open():
-                            return AgentResult(
-                                success=False,
-                                answer=self._partial_answer(),
-                                steps=self.steps,
-                                iterations=i + 1,
-                                state=AgentState.ERROR,
-                                error=f"circuit_breaker_open: {e}",
-                                metadata={"circuit": self._circuit.snapshot()},
-                            )
-                        result = AgentResult(
-                             success=False, answer=f"LLM error: {e}",
-                             steps=self.steps, iterations=i + 1,
-                             state=AgentState.ERROR, error=str(e),
-                           )
-                        self._finalize(result, query, session_id)
-                        return result
+                         if self._circuit.is_open():
+                             result =  AgentResult(
+                                   success=False,
+                                   answer=self._partial_answer(),
+                                   steps=self.steps,
+                                   iterations=i + 1,
+                                   state=AgentState.ERROR,
+                                   error=f"circuit_breaker_open: {e}",
+                                   metadata={"circuit": self._circuit.snapshot()},
+                               )
+                             self._finalize(result, query, session_id)
+                             self.tracer.emit(
+                                   "run_end",
+                                   step_index=i,
+                                   success=False,
+                                   iterations=i + 1,
+                                   error=f"circuit_breaker_open: {e}",
+                                  )
+                             return result
+                         result = AgentResult(
+                                    success=False, answer=f"LLM error: {e}",
+                                    steps=self.steps, iterations=i + 1,
+                                    state=AgentState.ERROR, error=str(e),
+                                    )
+                         self._finalize(result, query, session_id)
+                         self.tracer.emit(
+                                 "run_end",
+                                  step_index=i,
+                                  success=False,
+                                  iterations=i + 1,
+                                  error=f"llm_error: {e}",
+                                 )
+                         return result
 
                     llm_ms = (time.time() - t0) * 1000
 
                     usage = resp.get("usage", {})
                     self.tracer.emit(
-                        "llm_response",
-                        step_index=i,
-                        duration_ms=llm_ms,
-                        content_len=len(resp.get("content") or ""),
-                        n_tool_calls=len(resp.get("tool_calls", [])),
-                        prompt_tokens=usage.get("prompt_tokens", 0),
-                        completion_tokens=usage.get("completion_tokens", 0),
-                        finish_reason=resp.get("finish_reason", ""),
-                    )
+                           "llm_response",
+                           step_index=i,
+                           duration_ms=llm_ms,
+                           content_len=len(resp.get("content") or ""),
+                           n_tool_calls=len(resp.get("tool_calls", [])),
+                           prompt_tokens=usage.get("prompt_tokens", 0),
+                           completion_tokens=usage.get("completion_tokens", 0),
+                           finish_reason=resp.get("finish_reason", ""),
+                       )
                     content = resp.get("content")
                     tool_calls = resp.get("tool_calls", [])
 
@@ -542,16 +609,15 @@ class CoreAgent:
 
                         # ★ trace: 完成
                         self.tracer.emit(
-                            "run_end",
-                            step_index=i,
-                            success=True,
-                            iterations=i + 1,
-                            reason="completed",
-                        )
+                                 "run_end",
+                                step_index=i,
+                                 success=True,
+                               iterations=i + 1,
+                               reason="completed",
+                           )
 
                         if session_id:
                             self._save_session_messages(session_id, messages)
-
                         if self.verbose:
                             logger.info(f"✅ Completed in {i+1} iterations")
                         return result
@@ -652,23 +718,23 @@ class CoreAgent:
 
                         # ★ Layer 3：熔断检查
                         if self._circuit.is_open():
-                          logger.error(
-                          "circuit breaker open after %d consecutive failures",
-                         self._circuit.failure_count,
-                           )
+                            logger.error(
+                               "circuit breaker open after %d consecutive failures",
+                               self._circuit.failure_count,
+                            )
                           
-                          result= AgentResult(
-                            success=False,
-                            answer=self._partial_answer(),
-                            steps=self.steps,
-                            iterations=i + 1,
-                            state=AgentState.ERROR,
-                            error="circuit_breaker_open",
-                            metadata={"circuit": self._circuit.snapshot()},
-                               )   
+                            result= AgentResult(
+                                success=False,
+                                answer=self._partial_answer(),
+                                steps=self.steps,
+                                iterations=i + 1,
+                                state=AgentState.ERROR,
+                                error="circuit_breaker_open",
+                                metadata={"circuit": self._circuit.snapshot()},
+                           )   
                           
-                          self._finalize(result, query, session_id)
-                          return result
+                            self._finalize(result, query, session_id)
+                            return result
                         
                         if session_id:
                             self._save_session_messages(session_id, messages)
@@ -718,7 +784,7 @@ class CoreAgent:
                 )
                 if session_id:
                      self._save_session_messages(session_id, messages)
-
+       
                 result = AgentResult(
                     success=False,
                     answer="Reached maximum iterations",
@@ -732,8 +798,7 @@ class CoreAgent:
                 return result
             
         finally:
-            # ★ 无论怎么退出，都 flush trace
-            if session_id:                                  # ← 兜底保存（可选）
+            if session_id:                                  
                 try:
                     self._save_session_messages(session_id, messages)
                 except Exception:

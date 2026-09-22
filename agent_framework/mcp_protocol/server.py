@@ -604,7 +604,7 @@ class MCPServer:
             print(json.dumps(response.to_dict()), flush=True)
     
     def _run_http(self, host: str, port: int, path: str):
-        """通过 HTTP 运行"""
+        """通过 HTTP 运行"""     #短连接
         try:
             from http.server import HTTPServer, BaseHTTPRequestHandler
             import socketserver
