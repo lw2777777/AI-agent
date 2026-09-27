@@ -122,7 +122,23 @@ class CoreAgent:
         self.state = AgentState.IDLE
         self.steps: List[AgentStep] = []
         self.context: Dict[str, Any] = {}
-        self._reflector: Optional[Reflector] = None
+
+
+       # ★ 任务级反思器：仅在启用反思且 LLM 可用时构造
+        if enable_reflection and llm is not None:
+            try:
+                self._reflector = Reflector(
+                    llm=self._make_reflector_llm(llm),
+                    memory_store=memory_store,
+               )
+            except Exception:
+                logger.exception("Reflector init failed; task-level reflection disabled")
+                self._reflector = None
+        else:
+             self._reflector = None
+
+
+
         self.tracer = tracer or Tracer()
         
         self.llm_retry_policy = llm_retry_policy  or RetryPolicy()
@@ -189,6 +205,39 @@ class CoreAgent:
 
         return _SummaryLLM(llm, self)
 
+    def _make_reflector_llm(self, llm):
+       """
+    适配器:Reflector 内部用 llm.chat(prompt) 传字符串，
+    这里包装成 llm.chat(messages=[{role:user, content:...}])，
+    并复用 llm_retry_policy。
+    """
+       if llm is None:
+           return None
+
+       agent = self
+
+       class _ReflectorLLM:
+            def __init__(self, inner):
+            self._inner = inner
+
+            def chat(self, prompt, **kwargs):
+            # 兼容两种调用：传字符串 or 传 messages=
+                if isinstance(prompt, str):
+                   messages = [{"role": "user", "content": prompt}]
+                else:
+                messages = prompt
+
+            def _do():
+                return self._inner.chat(
+                    messages=messages,
+                    tools=None,
+                    tool_choice=None,
+                )
+            return retry_call(_do, agent.llm_retry_policy)
+
+       return _ReflectorLLM(llm)
+
+
 
     # ─────────────────────────────────────────────
     # 工具索引 / 提示词
@@ -213,7 +262,7 @@ class CoreAgent:
     ## Instructions
     1. Think step by step about what to do
     2. Use the provided tools when needed
-    3. Observe results and continue
+    3. Observe results and continue   
     4. When the task is complete, provide your final answer as plain text
 
     Important:
@@ -576,8 +625,9 @@ class CoreAgent:
                            completion_tokens=usage.get("completion_tokens", 0),
                            finish_reason=resp.get("finish_reason", ""),
                        )
-                    content = resp.get("content")
-                    tool_calls = resp.get("tool_calls", [])
+                    content = resp.get("content")  ### Thought 推理
+                    tool_calls = resp.get("tool_calls", [])  ### Action 决策
+                    ## 这里是标准的ReAct  范式
 
                     if self.verbose and content:
                         logger.info(f"💭 Thought: {content[:100]}...")
@@ -606,6 +656,10 @@ class CoreAgent:
                                 "messages": messages,
                                 "compression_stats": dict(self._compression_stats), 
                             } )
+                        
+                        # ★ 任务级反思
+                        result.reflection = self._reflect_on_task(query, result) 
+
 
                         # ★ trace: 完成
                         self.tracer.emit(
@@ -794,6 +848,11 @@ class CoreAgent:
                     error="max_iterations_exceeded",
                     metadata={ "compression_stats": dict(self._compression_stats)},
                 )
+
+                # ★ 失败任务更要反思
+                result.reflection = self._reflect_on_task(query, result)
+
+
                 self._finalize(result, query, session_id)
                 return result
             
@@ -815,6 +874,10 @@ class CoreAgent:
     def _finalize(self, result: AgentResult, query: str, session_id: Optional[str]):
         """任务结束时，写回记忆"""
         if not self.memory_manager:
+            return
+
+        if self.memory_store is None:          # ★ 新增保护
+            logger.debug("no memory_store; skip memory write")
             return
 
     # Layer 2: 不在这里写，由 Orchestrator 在平仓时写
@@ -893,6 +956,23 @@ class CoreAgent:
 
         return False
 
+    def _steps_to_dicts(self, steps: List[AgentStep]) -> List[Dict[str, Any]]:
+        """把 AgentStep 列表转成 Reflector 需要的 dict 列表"""
+        return [
+           {
+            "thought": s.thought,
+            "action": s.action,
+            "action_input": s.action_input,
+            "observation": s.observation,
+            "success": s.success,
+            "error": s.error,
+          }
+          for s in steps
+      ]
+
+
+
+
     def _reflect_on_step(
         self,
         query: str,
@@ -960,6 +1040,60 @@ class CoreAgent:
         except Exception as e:
             logger.warning(f"Step reflection failed (ignored): {e}")
             return ""
+
+
+    def _reflect_on_task(
+        self,
+        query: str,
+        result: AgentResult,
+    ) -> Optional[ReflectionResult]:
+      """
+      任务结束时整体反思。
+      返回 None 表示跳过（未启用 / reflector 缺失 / 太简单不值得）。
+      """
+      if not getattr(self, "enable_reflection", True):
+          return None
+      if self._reflector is None:
+          return None
+    # 成功且只有 1 步、又没强制反思 → 省 token
+      if result.success and len(result.steps) <= 1 and not getattr(self, "always_reflect", False):
+          return None
+
+      t0 = time.time()
+      try:
+          steps_as_dicts = self._steps_to_dicts(result.steps)
+          final_result_dict = {
+              "success": result.success,
+              "answer": result.answer,
+              "error": result.error,
+              "iterations": result.iterations,
+          }
+          reflection = self._reflector.reflect_on_task(
+              steps=steps_as_dicts,
+              task=query,
+              final_result=final_result_dict,
+          )
+  
+          self.tracer.emit(
+              "reflection_task",
+              duration_ms=(time.time() - t0) * 1000,
+              success=bool(reflection),
+              n_lessons=len(getattr(reflection, "lessons", []) or []),
+              n_improvements=len(getattr(reflection, "improvements", []) or []),
+          )
+          if self.verbose and reflection:
+              logger.info(
+                 f"🪞 Task reflection: "
+                 f"{len(reflection.lessons)} lessons, "
+                 f"{len(reflection.improvements)} improvements"
+             )
+          return reflection
+
+      except Exception:
+          logger.exception("Task reflection failed (ignored)")
+          return None
+
+    
 
     # ─────────────────────────────────────────────
     # session 存储
