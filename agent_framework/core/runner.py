@@ -22,8 +22,33 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Union
 import logging
 from .trace import Tracer
+from .core_agent import CoreAgent
+from .retry import RetryPolicy
+from ..tools.tools_registry import get_tools_registry, ToolCategory
+
 
 logger = logging.getLogger(__name__)
+
+import threading
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..mcp_protocol.mcp_lifecycle import MCPClientPool
+
+# ── MCP client pool（全局单例，跨任务复用）──
+_MCP_POOL: Optional["MCPClientPool"] = None
+_MCP_LOCK = threading.Lock()
+
+
+def _get_mcp_pool() -> "MCPClientPool":
+    """全局单例 MCP client pool。避免每次 start_task 都重连。"""
+    global _MCP_POOL
+    if _MCP_POOL is None:
+        with _MCP_LOCK:
+            if _MCP_POOL is None:
+                from ..mcp_protocol.mcp_lifecycle import MCPClientPool
+                _MCP_POOL = MCPClientPool(auto_atexit=True)
+    return _MCP_POOL
 
 _DEFAULT_DB = str(Path(__file__).parent.parent.parent.parent / "agent_tasks.db")
 
@@ -71,6 +96,7 @@ class TaskStateManager:
                     result TEXT,
                     error TEXT,
                     plan_json TEXT,
+                    checkpoint_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -83,6 +109,14 @@ class TaskStateManager:
                 CREATE INDEX IF NOT EXISTS idx_tasks_created 
                 ON agent_tasks(created_at DESC)
             """)
+            # 兼容旧库
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_tasks)")}
+        if "checkpoint_json" not in cols:
+            conn.execute("ALTER TABLE agent_tasks ADD COLUMN checkpoint_json TEXT")
+
 
     def create_task(self, query: str, config: Dict[str, Any]) -> str:
         """创建任务"""
@@ -134,27 +168,37 @@ class TaskStateManager:
     def save_checkpoint(
         self,
         task_id: str,
-        step_index: int,
-        step_result: Dict[str, Any]
+        checkpoint: Dict[str, Any],
     ) -> None:
-        """保存检查点"""
-        task = self.get_task(task_id)
-        if not task:
-            return
+         """
+        保存完整断点。checkpoint 建议结构：
+        {
+            "step_index": int,
+            "messages": [...],        # 对话历史
+            "scratchpad": {...},      # 中间结果
+            "plan": {...},            # 计划
+            "last_tool_results": [...],
+        }
+        """
+       
+         now = datetime.now().isoformat()
+         with self._conn() as conn:
+             conn.execute(
+                 "UPDATE agent_tasks SET checkpoint_json = ?, updated_at = ? WHERE id = ?",
+                 (json.dumps(checkpoint), now, task_id)
+             )
 
-        steps = task['steps']
-        # 确保列表足够长
-        while len(steps) <= step_index:
-            steps.append({})
-
-        steps[step_index] = step_result
-
-        now = datetime.now().isoformat()
+    
+    def load_checkpoint(self, task_id: str) -> Optional[Dict[str, Any]]:
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE agent_tasks SET steps_json = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(steps), now, task_id)
-            )
+            row = conn.execute(
+                "SELECT checkpoint_json FROM agent_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        if not row or not row["checkpoint_json"]:
+            return None
+        return json.loads(row["checkpoint_json"])
+
+
 
     def complete_task(self, task_id: str, result: Any) -> None:
         """完成任务"""
@@ -220,6 +264,36 @@ class TaskStateManager:
         return tasks
 
 
+    def _execute_with_checkpoints(
+       self,
+       task_id: str,
+       query: str,
+       config: Dict[str, Any],
+       checkpoint: Optional[Dict[str, Any]] = None,
+     ):
+       agent = self._create_agent(config)
+       self._agent = agent
+
+       def on_step(step_index: int, state: Dict[str, Any]) -> None:
+        # state 就是 agent.export_state(...) 的返回值
+           self.state_mgr.save_checkpoint(task_id, {
+               "step_index": step_index,
+               "state": state,          # ← 整个快照
+          })
+           self._emit('task_checkpoint', {
+              'task_id': task_id,
+              'step_index': step_index,
+          })
+
+    # 统一入口：checkpoint=None 就是从零开始
+       result = agent.run(
+          query,
+          config,
+          checkpoint=checkpoint["state"] if checkpoint else None,  # ★
+          on_step=on_step,                                          # ★
+      )
+       return result
+
 class AgenticRunner:
     """
     Agent执行器
@@ -240,19 +314,67 @@ class AgenticRunner:
     ):
         self.api_keys = api_keys
         self.db_path = db_path
-        self.state_mgr = TaskStateManager(db_path)
+        self.state_mgr = TaskStateManager(db_path)   #state_mgr 是 TaskStateManager 的实例，负责把任务的状态持久化到 SQLite 数据库里。
         self._emit = emit or (lambda kind, payload: None)
         self._agent = None
 
+    def _ensure_mcp_clients(self, mcp_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        根据 config["mcp"] 确保 client 已连上。返回 {namespace: client}。
+
+        幂等：同名 server 只连一次。pool 是全局单例，所以跨任务复用。
+        """
+        from ..mcp_protocol.config import load_mcp_configs
+
+        cfgs = load_mcp_configs(mcp_config)
+        if not cfgs:
+            return {}
+
+        pool = _get_mcp_pool()
+
+        # 只 add 没加过的
+        existing = set(pool.names())
+        new_cfgs = [c for c in cfgs if c.name not in existing]
+        if new_cfgs:
+            pool.add_many(new_cfgs)
+            results = pool.connect_all()
+            for name, ok in results.items():
+                if not ok:
+                    logger.warning("MCP server '%s' failed to connect", name)
+
+        # 返回当前 pool 里所有 client
+        return {name: pool.get(name) for name in pool.names()}
+
+    
     def _create_agent(self, config: Dict[str, Any],tracer: Optional[Tracer] = None):
         """创建Agent"""
         from .core_agent import CoreAgent
         from .retry import RetryPolicy
         from ..tools.tools_registry import ToolsRegistry
+        registry = ToolsRegistry(...)
+
+        mcp_clients = self._ensure_mcp_clients(config.get("mcp", {}))
+        for ns, client in mcp_clients.items():
+            if client is None:
+                continue
+            try:
+                mapping = registry.load_from_mcp(
+                    client=client,
+                    namespace=ns,
+                    category=ToolCategory.CUSTOM,
+                    overwrite=False,
+                    prefix_sep="_",          # ★ LLM 函数名不能带点
+                )
+                logger.info("MCP[%s] loaded %d tools: %s",
+                            ns, len(mapping), list(mapping))
+            except Exception:
+                logger.exception("MCP[%s] load failed", ns)
+
+
 
         # 获取工具
         tool_names = config.get('tools', [])
-        registry = ToolsRegistry(...)   # 关键：先有实例
+       
         tools = registry.get_tools(tool_names, self.api_keys)
         
         trace_cfg = config.get('trace', {})
@@ -284,12 +406,11 @@ class AgenticRunner:
             tools=tools,
             memory_store=memory_store,
             max_iterations=config.get('max_iterations', 10),
-            retry_policy=retry_policy,          # ← 按 core-agent 实际名字
+            llm_retry_policy=llm_retry_policy,          # ← 按 core-agent 实际名字
             circuit_threshold=5,
             enable_reflection=config.get('enable_reflection', True),
             verbose=config.get('verbose', True),
             tracer=tracer or Tracer(),
-            session_id=config.get("session_id")
          )
 
     def _create_llm(self, model_config: Dict[str, Any]):
@@ -356,61 +477,79 @@ class AgenticRunner:
             }
 
     def resume_task(self, task_id: str) -> Dict[str, Any]:
-        """
-        恢复任务
-
-        Args:
-            task_id: 任务ID
-
-        Returns:
-            {'success': bool, ...}
-        """
+        """恢复任务（从断点继续）"""
         task = self.state_mgr.get_task(task_id)
         if not task:
-            return {'success': False, 'error': f'Task {task_id} not found'}
+          return {'success': False, 'error': f'Task {task_id} not found'}
 
         if task['status'] == 'completed':
             return {
-                'success': True,
-                'task_id': task_id,
-                'result': task['result'],
-                'already_completed': True
-            }
+               'success': True,
+               'task_id': task_id,
+               'result': task['result'],
+               'already_completed': True
+           }
 
         if task['status'] == 'cancelled':
             return {'success': False, 'task_id': task_id, 'cancelled': True}
 
-        # 恢复执行
-        self.state_mgr.update_status(task_id, 'running')
-        self._emit('task_resumed', {'task_id': task_id})
+    # ★ 1. 读出断点
+        checkpoint = task.get('checkpoint')          # 来自 checkpoint_json 字段
+        from_step = checkpoint.get('step_index', 0) if checkpoint else 0
 
-        # 创建Agent并恢复状态
+        logger.info(
+            "Resume task %s from step %s (checkpoint=%s)",
+            task_id, from_step, "yes" if checkpoint else "no",
+        )
+
+    # 2. 恢复执行
+        self.state_mgr.update_status(task_id, 'running')
+        self._emit('task_resumed', {'task_id': task_id, 'from_step': from_step})
+
+    # 3. 创建 Agent
         self._agent = self._create_agent(task['config'])
 
+    # ★ 4. 定义 on_step：每轮工具执行完就存快照
+        def on_step(step_index: int, state: Dict[str, Any]) -> None:
+            self.state_mgr.save_checkpoint(task_id, {
+              "step_index": step_index,
+              "state": state,
+        })
+            self._emit('task_checkpoint', {
+              'task_id': task_id,
+              'step_index': step_index,
+        })
+
         try:
-            # 简化版: 重新执行
-            result = self._agent.run(task['query'], task['config'])
+        # ★ 5. 把 checkpoint 传给 run()
+            result = self._agent.run(
+               task['query'],
+               task['config'],
+               checkpoint=checkpoint["state"] if checkpoint else None,   # ★
+               on_step=on_step,                                           # ★
+        )
             self.state_mgr.complete_task(task_id, result.answer)
 
             self._emit('task_completed', {
-                'task_id': task_id,
-                'result': result.answer
-            })
+               'task_id': task_id,
+               'result': result.answer
+           })
 
             return {
-                'success': True,
-                'task_id': task_id,
-                'result': result.answer
-            }
+              'success': True,
+              'task_id': task_id,
+              'result': result.answer,
+              'resumed_from_step': from_step,
+          }
 
         except Exception as e:
             self.state_mgr.fail_task(task_id, str(e))
+            self._emit('task_error', {'task_id': task_id, 'error': str(e)})
             return {
                 'success': False,
                 'task_id': task_id,
                 'error': str(e)
             }
-
     def cancel_task(self, task_id: str) -> Dict[str, Any]:
         """
         取消任务

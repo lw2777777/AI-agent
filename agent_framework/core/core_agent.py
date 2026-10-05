@@ -10,6 +10,9 @@ Core Agent - 完整的Agent实现
 6. MCP协议支持
 """
 
+from collections import deque
+import hashlib
+
 from typing import Dict, Any, List, Optional, Callable, Union
 from dataclasses import dataclass, field
 from enum import Enum
@@ -26,6 +29,7 @@ from .retry import RetryPolicy, retry_call
 from .circuit_breaker import CircuitBreaker
 from .error_recovery import ErrorRecovery, RecoveryAction
 
+from typing import Dict, Any, List, Optional, Callable, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +169,13 @@ class CoreAgent:
            "total_tokens_saved": 0,
         }
 
+        self._loop_window = kwargs.get("loop_guard_window", 10)
+        self._loop_exact_limit = kwargs.get("exact_repeat_limit", 3)
+        self._loop_pattern_limit = kwargs.get("loop_pattern_limit", 2)
+        self._loop_history: deque = deque(maxlen=self._loop_window)
+        self._loop_embedder = kwargs.get("loop_guard_embedder")  # 可选
+        self._loop_vec_cache: Dict[str, Any] = {}
+
         # 反思相关开关
         self.high_risk_tools = kwargs.get(
             "high_risk_tools",
@@ -218,22 +229,22 @@ class CoreAgent:
 
        class _ReflectorLLM:
             def __init__(self, inner):
-            self._inner = inner
+                self._inner = inner
 
             def chat(self, prompt, **kwargs):
             # 兼容两种调用：传字符串 or 传 messages=
                 if isinstance(prompt, str):
                    messages = [{"role": "user", "content": prompt}]
                 else:
-                messages = prompt
+                    messages = prompt
 
-            def _do():
-                return self._inner.chat(
-                    messages=messages,
-                    tools=None,
-                    tool_choice=None,
-                )
-            return retry_call(_do, agent.llm_retry_policy)
+                def _do():
+                    return self._inner.chat(
+                        messages=messages,
+                        tools=None,
+                        tool_choice=None,
+                    )
+                return retry_call(_do, agent.llm_retry_policy)
 
        return _ReflectorLLM(llm)
 
@@ -426,11 +437,16 @@ class CoreAgent:
         config: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         stream: bool = False,
+         # ★ 新增：断点相关
+        checkpoint: Optional[Dict[str, Any]] = None,
+        on_step: Optional[Callable[[int, Dict[str, Any]], None]] = None,
     ) -> AgentResult:
         """
         执行任务
 
         Args:
+            checkpoint: 传入则从断点继续（跳过已完成迭代，复用 messages）
+            on_step: 每完成一步（或每轮工具执行后）回调，用于持久化快照
             query: 任务描述
             config: 配置覆盖
             session_id: 会话ID
@@ -458,8 +474,21 @@ class CoreAgent:
                 )
 
                 self.state = AgentState.THINKING
-                self.steps = []
-                self.context = {
+
+                if checkpoint:
+                    # ── 从断点恢复 ──
+                    self.import_state(checkpoint)
+                    messages = list(checkpoint.get("messages", []))
+                    start_iter = int(checkpoint.get("next_iteration", 0))
+                if self.verbose:
+                    logger.info(
+                             "♻️ Resume from iteration %d, %d steps, %d messages",
+                             start_iter, len(self.steps), len(messages),
+                             )
+                else:
+                     self.steps = []
+                     start_iter = 0
+                     self.context = {
                     "query": query,
                     "config": config or {},
                     "session_id": session_id,
@@ -470,6 +499,12 @@ class CoreAgent:
                     logger.info(f"🚀 Agent {self.name} starting task: {query[:100]}...")
 
                 # ── 1. 构造初始 messages（优先从 session 加载）──
+            if checkpoint:
+                    # messages 已从 checkpoint 恢复，不再重新注入 system / user
+                if not messages or messages[0].get("role") != "system":
+                     messages.insert(0, {"role": "system", "content": self.system_prompt})
+            else:
+               
                 if session_id:
                     messages: List[Dict[str, Any]] = self._load_session_messages(session_id)
                 else:
@@ -488,8 +523,13 @@ class CoreAgent:
                 # ── 2. 工具 schema ──
                 tool_schemas = [tool.to_schema() for tool in self.tools.values()]
 
+
+                                # ★ 循环防护 reset
+                self._loop_history.clear()
+                self._loop_vec_cache.clear()
+
                 # ── 3. 主循环 ──
-                for i in range(self.max_iterations):
+                for i in range(start_iter,self.max_iterations):
                     if self.verbose:
                         logger.info(f"🔄 Iteration {i+1}/{self.max_iterations}")
                     self.state = AgentState.THINKING
@@ -703,6 +743,34 @@ class CoreAgent:
                         action_input = tc["arguments"]
                         call_id = tc["id"]
 
+                                                # ★ 循环检测
+                        stop, reason = self._loop_check(action_name, action_input)
+                        if stop:
+                            logger.warning("🔁 Loop detected: %s", reason)
+                            self.tracer.emit(
+                                "loop_detected",
+                                step_index=i,
+                                tool=action_name,
+                                reason=reason,
+                                history_len=len(self.steps),
+                            )
+                            self.state = AgentState.ERROR
+                            result = AgentResult(
+                                success=False,
+                                answer=f"[loop-guard] Agent stopped: {reason}",
+                                steps=self.steps,
+                                iterations=i + 1,
+                                state=AgentState.ERROR,
+                                error=f"loop_detected: {reason}",
+                                metadata={"loop_guard": {
+                                    "reason": reason,
+                                    "tool": action_name,
+                                }},
+                            )
+                            self._finalize(result, query, session_id)
+                            return result
+
+
                         t0 = time.time()
                         self.tracer.emit(
                             "tool_call",
@@ -826,6 +894,15 @@ class CoreAgent:
                     # 每轮工具执行完，落一次 session
                     if session_id:
                         self._save_session_messages(session_id, messages)
+                     # ★ 每轮工具执行后，导出快照回调（用于断点持久化）
+                    if on_step is not None:
+                        try:
+                            on_step(i + 1, self.export_state(
+                                messages=messages,
+                                next_iteration=i + 1,
+                            ))
+                        except Exception:
+                            logger.exception("on_step callback failed (ignored)")    
 
                 # ── 6. 超出最大迭代 ──
                 self.state = AgentState.ERROR
@@ -940,6 +1017,7 @@ class CoreAgent:
             same_tool_calls = [
                 s for s in history
                 if isinstance(s, dict) and s.get("tool") == tool_name
+                or (hasattr(s, "action") and s.action == tool_name)
             ]
             if len(same_tool_calls) >= 2:
                 return True
@@ -1131,6 +1209,88 @@ class CoreAgent:
         )
 
     # ─────────────────────────────────────────────
+    # ★ 断点：状态导出 / 导入
+    # ─────────────────────────────────────────────
+    def export_state(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        next_iteration: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        导出当前 Agent 内部状态，用于持久化。
+
+        只导出「纯数据」，不含 llm / tools / tracer 等运行时对象。
+
+        Args:
+            messages: 当前 messages（run() 内部持有，需显式传入）
+            next_iteration: 下一步应从哪个迭代继续
+        """
+        return {
+            "version": 1,
+            "agent_name": self.name,
+            "state": self.state.value,
+            "context": self._safe_jsonable(self.context),
+            "steps": [self._step_to_dict(s) for s in self.steps],
+            "messages": self._safe_jsonable(messages or []),
+            "next_iteration": (
+                next_iteration
+                if next_iteration is not None
+                else len(self.steps)
+            ),
+            "loop_history": [
+                {"fp": h.get("fp"), "tool": h.get("tool")}
+                for h in self._loop_history
+            ],
+            "compression_stats": dict(self._compression_stats),
+            "saved_at": datetime.now().isoformat(),
+        }
+
+    def import_state(self, checkpoint: Dict[str, Any]) -> None:
+        """从 checkpoint 恢复内部状态（不含 messages，messages 在 run 里处理）"""
+        state_str = checkpoint.get("state", AgentState.IDLE.value)
+        try:
+            self.state = AgentState(state_str)
+        except ValueError:
+            self.state = AgentState.IDLE
+
+        self.context = checkpoint.get("context", {}) or {}
+
+        # 恢复 steps
+        self.steps = [
+            self._dict_to_step(d) for d in checkpoint.get("steps", [])
+        ]
+
+        # 恢复 loop history
+        self._loop_history.clear()
+        for h in checkpoint.get("loop_history", []):
+            self._loop_history.append({
+                "fp": h.get("fp"),
+                "tool": h.get("tool"),
+                "vec": None,          # 向量不恢复，重建时按需算
+            })
+
+        # 恢复压缩统计
+        stats = checkpoint.get("compression_stats")
+        if isinstance(stats, dict):
+            self._compression_stats.update(stats)
+
+    def restore(self, checkpoint: Dict[str, Any]) -> None:
+        """
+        对外统一恢复入口。
+        兼容两种结构：
+          - {"state": {...}}          # Runner 包的
+          - {"messages": ..., "steps": ...}  # 裸 state
+        """
+        inner = checkpoint.get("state", checkpoint)
+        self.import_state(inner)
+        logger.info(
+            "Agent '%s' restored: state=%s, steps=%d, next_iter=%s",
+            self.name, self.state.value, len(self.steps),
+            inner.get("next_iteration"),
+        )
+
+
+    # ─────────────────────────────────────────────
     # 其他工具方法
     # ─────────────────────────────────────────────
     def get_response_content(self, response) -> str:
@@ -1165,6 +1325,137 @@ class CoreAgent:
             "max_iterations": self.max_iterations,
             "enable_reflection": self.enable_reflection,
         }
+
+        # ─────────────────────────────────────────────
+    # ★ 循环防护
+    # ─────────────────────────────────────────────
+    def _loop_fingerprint(self, tool: str, args: Any) -> str:
+        """输入指纹：tool + args（与结果解耦，用于缓存/查找）"""
+        payload = json.dumps(
+            {"tool": tool, "args": args or {}},
+            sort_keys=True, default=str,
+        )
+        return hashlib.md5(payload.encode()).hexdigest()
+
+
+
+    def _loop_result_fingerprint(self, result: Any) -> str:
+       """结果指纹：只看结果内容"""
+       payload = json.dumps(result, sort_keys=True, default=str)
+       return hashlib.md5(payload.encode()).hexdigest()
+
+    def _loop_vec(self, tool: str, args: Any):
+
+        if not self._loop_embedder:
+            return None
+        fp = self._loop_fingerprint(tool, args)
+        if fp not in self._loop_vec_cache:
+            text = json.dumps(
+                {"tool": tool, "args": args or {}},
+                sort_keys=True, default=str,
+            )
+            self._loop_vec_cache[fp] = self._loop_embedder(text)
+        return self._loop_vec_cache[fp]
+
+    def _loop_detect_cycle(self) -> bool:
+        if len(self._loop_history) < 4:
+            return False
+        fps = [h["fp"] for h in self._loop_history]
+        for period in (2, 3):
+            if len(fps) < period * self._loop_pattern_limit:
+                continue
+            pattern = fps[-period:]
+            match = 0
+            for i in range(len(fps) - period, -1, -period):
+                if fps[i - period:i] == pattern:
+                    match += 1
+                else:
+                    break
+            if match >= self._loop_pattern_limit:
+                return True
+        return False
+
+    def _loop_check(self, tool: str, args: Any) -> Tuple[bool, str]:
+        """
+        每一步动作执行前调用。返回 (should_stop, reason)。
+        """
+        fp = self._loop_fingerprint(tool, args)
+
+        # 1. 完全重复
+        repeats = sum(1 for h in self._loop_history if h["fp"] == fp)
+        if repeats >= self._loop_exact_limit:
+            return True, (
+                f"Exact repeat: '{tool}' repeated "
+                f"{repeats + 1} times with same args"
+            )
+
+        # 2. 语义重复（可选）
+        if self._loop_embedder:
+            v = self._loop_vec(tool, args)
+            if v is not None:
+                for h in self._loop_history:
+                    if h.get("vec") is None:
+                        continue
+                    sim = self._loop_cosine(v, h["vec"])
+                    if sim >= 0.95 and h["fp"] != fp:
+                        return True, (
+                            f"Semantic repeat: sim={sim:.3f} "
+                            f"with previous '{h['tool']}'"
+                        )
+
+        # 3. 循环模式 A-B-A-B
+        if self._loop_detect_cycle():
+            return True, "Cyclic pattern detected (A-B-A-B)"
+
+        # 记录
+        self._loop_history.append({
+            "fp": fp,
+            "tool": tool,
+            "vec": self._loop_vec(tool, args),
+            "result_fp": None,
+            "result": None,
+        })
+        return False, ""
+
+    def _loop_observe(self, tool: str, args: Any, result: Any) -> Tuple[bool, str]:
+      """
+      动作执行【后】调用，把结果回填到最近一条匹配的历史记录，
+      并基于"输入相同 + 结果相同"做真正的冗余判断。
+      返回 (should_stop, reason)。
+      """
+      fp = self._loop_fingerprint(tool, args)
+      result_fp = self._loop_result_fingerprint(result)
+
+    # 找到最近一条同输入的未回填记录并回填
+      for h in reversed(self._loop_history):
+          if h["fp"] == fp and h.get("result_fp") is None:
+              h["result_fp"] = result_fp
+              h["result"] = result
+              break
+
+       # 统计：输入相同 且 结果也相同 的次数
+      same_io = [
+          h for h in self._loop_history
+          if h["fp"] == fp and h.get("result_fp") == result_fp
+      ]
+      if len(same_io) >= self._loop_exact_limit:
+          return True, (
+              f"Redundant repeat: '{tool}' produced identical result "
+              f"{len(same_io)} times (same input & same output)"
+          )
+
+    # 输入相同但结果不同 → 视为"有进展"，放行（例如轮询）
+      return False, ""
+
+
+    @staticmethod
+    def _loop_cosine(a, b) -> float:
+        import numpy as np
+        a, b = np.asarray(a), np.asarray(b)
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1e-10
+        return float(a @ b / denom)
+
+
 
     def _partial_answer(self) -> str:
         """熔断时返回部分答案：取最后一个非空 observation 或 thought"""
