@@ -33,6 +33,59 @@ from typing import Dict, Any, List, Optional, Callable, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class ToolResult:
+    """结构化工具结果，替代脆弱的 startswith('Error:')"""
+    success: bool
+    content: str
+    error: Optional[str] = None
+    error_type: Optional[str] = None   # "validation" | "execution" | "guardrail" | "not_found"
+
+    def to_observation(self) -> str:
+        """转成回灌给 LLM 的文本"""
+        return self.content if self.success else f"Error: {self.content}"
+
+
+def _validate_against_schema(inputs: Dict[str, Any], schema: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    轻量 JSON Schema 子集校验：type / required / enum / minimum / maximum。
+    返回 (ok, error_message)。
+    """
+    params = schema.get("parameters", {}) or {}
+    props = params.get("properties", {}) or {}
+    required = set(params.get("required", []) or [])
+
+    if not isinstance(inputs, dict):
+        return False, f"arguments must be an object, got {type(inputs).__name__}"
+
+    # 1. 必填
+    missing = [k for k in required if k not in inputs or inputs[k] is None]
+    if missing:
+        return False, f"missing required field(s): {', '.join(missing)}"
+
+    # 2. 逐字段类型 / 枚举 / 范围
+    type_map = {
+        "string": str, "integer": int, "number": (int, float),
+        "boolean": bool, "array": list, "object": dict,
+    }
+    for key, val in inputs.items():
+        spec = props.get(key)
+        if not spec:
+            continue  # 允许额外字段；如需严格可改成拒绝
+        expected = spec.get("type")
+        if expected in type_map and not isinstance(val, type_map[expected]):
+            # bool 是 int 的子类，特判
+            if not (expected in ("integer", "number") and isinstance(val, bool)):
+                return False, f"field '{key}' expects {expected}, got {type(val).__name__}"
+        if "enum" in spec and val not in spec["enum"]:
+            return False, f"field '{key}' must be one of {spec['enum']}, got {val!r}"
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            if "minimum" in spec and val < spec["minimum"]:
+                return False, f"field '{key}' must be >= {spec['minimum']}, got {val}"
+            if "maximum" in spec and val > spec["maximum"]:
+                return False, f"field '{key}' must be <= {spec['maximum']}, got {val}"
+
+    return True, ""
 
 class AgentState(Enum):
     """Agent状态"""
@@ -393,41 +446,68 @@ class CoreAgent:
     # ─────────────────────────────────────────────
     # 工具执行
     # ─────────────────────────────────────────────
-    def _execute_tool(self, name: str, inputs: Dict) -> str:
-        # ★ Layer 0: guardrails
+    def _execute_tool(self, name: str, inputs: Dict) -> ToolResult:
+    # ── Layer 1: 存在性校验 ──
+        tool = self.tools.get(name)
+        if not tool:
+            return ToolResult(
+                success=False,
+                content=f"Tool '{name}' not found. Available: {list(self.tools.keys())}",
+                error_type="not_found",
+          )
+
+    # ── Layer 2: schema 校验（★ 新增，补最大缺口）──
+        schema = None
+        if hasattr(tool, "to_schema"):
+            try:
+                schema = tool.to_schema()
+            except Exception:
+                schema = None
+        if schema:
+            ok, err = _validate_against_schema(inputs or {}, schema)
+            if not ok:
+                return ToolResult(
+                    success=False,
+                    content=(
+                        f"Invalid arguments for '{name}': {err}. "
+                        f"Please fix the arguments and retry."
+                    ),
+                    error_type="validation",
+                )
+
+    # ── Layer 3: guardrails（安全）──
         if self.guardrails is not None:
             verdict = self.guardrails.check(
-                tool_name=name,
-                arguments=inputs,
-                session_id=self.context.get("session_id"),
-            )
+               tool_name=name,
+               arguments=inputs,
+               session_id=self.context.get("session_id"),
+             )  
             if not verdict.allowed:
                 logger.warning(
                     "Guardrail blocked %s [%s]: %s",
                     name, verdict.risk_level.value, verdict.reason,
                 )
-
-                return (
-                    f"Error: blocked by guardrail "
-                    f"[{verdict.risk_level.value}]: {verdict.reason}"
-                )
-            # 允许改写参数（如路径规范化）
+                return ToolResult(
+                    success=False,
+                    content=f"blocked by guardrail [{verdict.risk_level.value}]: {verdict.reason}",
+                    error_type="guardrail",
+               )
             if verdict.modified_args is not None:
                 inputs = verdict.modified_args
 
-        # 原有逻辑
-        tool = self.tools.get(name)
-        if not tool:
-            return f"Error: Tool '{name}' not found"
+    # ── Layer 4: 执行 + 异常兜底 ──
         try:
-            handler = getattr(tool, 'handler', None)
-            if handler is None:
-                handler = tool
-            result = handler(**inputs)
-            return str(result)
+            handler = getattr(tool, "handler", None) or tool
+            result = handler(**(inputs or {}))
+            return ToolResult(success=True, content=str(result))
         except Exception as e:
             logger.exception(f"Tool {name} failed")
-            return f"Error: {type(e).__name__}: {str(e)}"
+            return ToolResult(
+                success=False,
+                content=f"{type(e).__name__}: {e}",
+                error_type="execution",
+            )
+
     # ─────────────────────────────────────────────
     # 主入口
     # ─────────────────────────────────────────────
@@ -785,20 +865,24 @@ class CoreAgent:
                                 f"{json.dumps(action_input, ensure_ascii=False)[:200]}"
                             )
 
-                        observation = self._execute_tool(action_name, action_input) 
-                           #是最原始的、工具直接返回的内容
+                        tool_result: ToolResult = self._execute_tool(action_name, action_input)
                         self.state = AgentState.OBSERVING
                         tool_ms = (time.time() - t0) * 1000
-                        success = not str(observation).startswith("Error:")
+                        success = tool_result.success
+                        observation = tool_result.to_observation()
 
                         # ★ Layer 2：失败时反馈给 circuit，并记录提示
                         if success:
                             self._circuit.record_success()
+                        elif tool_result.error_type == "validation":
+                       # 参数错是 LLM 可自愈的，不触发熔断计数
+                            pass  
                         else:
                             self._circuit.record_failure()
                             observation = (
                                 f"{observation}\n\n"
-                                f"[System] This is consecutive failure #{self._circuit.failure_count}. "
+                                f"[System] Failure type={tool_result.error_type}, "
+                                f"consecutive failure #{self._circuit.failure_count}. "
                                 f"Consider a different approach or tool."
                               )
 
@@ -809,7 +893,7 @@ class CoreAgent:
                               action_input=action_input,
                               observation=str(observation),
                               success=success,
-                              error=str(observation) if not success else None,)
+                              error=tool_result.content if not success else None,)
                         self.steps.append(step)
                         
                         messages.append({
